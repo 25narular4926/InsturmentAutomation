@@ -1,0 +1,22 @@
+{
+  "_comment": "Framed view for capturing a routed AFG signal end-to-end. Fast timebase so a FULL record fills in milliseconds (far under the capture settle) and shows several complete cycles - unlike bench_full's 4 s/div, where a 40 s record only partly fills. Pair with a ~1 kHz AFG signal. CH1/CH2 2.5 V/div DC 1 MOhm, NO bandwidth key (so a 70 MHz MSO24 does not clamp it), 0.5 ms/div (5 ms window ~ 5 cycles at 1 kHz), trigger CH1 @ 5 V (midpoint of a 0-10 V signal), AUTO sweep.",
+  "name": "signal_view",
+
+  "horizontal_mode": "MANual",
+  "sample_rate": 2e6,
+  "horizontal_scale": 0.5e-3,
+  "record_length": 10000,
+  "horizontal_position": 50.0,
+  "acquire_mode": "SAMple",
+
+  "trigger_mode": "AUTO",
+  "trigger_source": "CH1",
+  "trigger_level": 5.0,
+  "trigger_slope": "RISE",
+
+  "default_channel": { "scale": 2.5, "offset": 0.0, "coupling": "DC", "termination": 1e6 },
+  "channels": {
+    "1": { "scale": 2.5, "offset": 0.0, "coupling": "DC", "termination": 1e6 },
+    "2": { "scale": 2.5, "offset": 0.0, "coupling": "DC", "termination": 1e6 }
+  }
+}

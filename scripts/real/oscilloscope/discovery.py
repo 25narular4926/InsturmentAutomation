@@ -35,10 +35,15 @@ import bench_socket as bs  # noqa: E402
 # 5025 = LXI raw SCPI socket. We try each until *IDN? comes back.
 DEFAULT_PORTS = (4000, 5025)
 
-# Scope vendors and model families (to keep scopes and drop other LXI gear like the AFG).
-# Families cover both brands: MSO/MSOX, DPO, MDO, TDS, DSO/DSOX, EDUX.
-_SCOPE_VENDORS = ("TEKTRONIX", "KEYSIGHT", "AGILENT")
+# Instrument vendors we know how to drive (scopes AND function generators live here).
+_INSTRUMENT_VENDORS = ("TEKTRONIX", "KEYSIGHT", "AGILENT")
+# Oscilloscope model families, both brands: MSO/MSOX, DPO, MDO, TDS, TBS, DSO/DSOX, EDUX.
 _SCOPE_FAMILIES = ("MSO", "DPO", "MDO", "TDS", "TBS", "DSO", "EDUX")
+# Function-generator / AWG model families: Tektronix AFG/AWG, Keysight 332xx/335xx/336xx
+# (e.g. 33210A, 33220A, 33250A, 33509B..33522A, 33611A..33622A). 4-digit prefixes match the
+# real model strings without being as loose as a bare "33".
+_AFG_FAMILIES = ("AFG", "AWG", "3320", "3321", "3322", "3325",
+                 "3350", "3351", "3352", "3360", "3361", "3362")
 
 # LXI mDNS service types instruments advertise.
 _MDNS_SERVICES = ("_lxi._tcp.local.", "_scpi-raw._tcp.local.",
@@ -49,14 +54,20 @@ _MDNS_SERVICES = ("_lxi._tcp.local.", "_scpi-raw._tcp.local.",
 # Identify a single host.
 # ---------------------------------------------------------------------------
 def probe_idn(ip: str, port: int, timeout: float = 1.0) -> str:
-    """Open a socket, send *IDN?, and return the reply (empty string on any failure)."""
+    """Open a socket, send *IDN?, and return the reply (empty string on any failure).
+
+    The initial banner drain uses a SHORT timeout, not the full one: some instruments (the
+    AFG especially) drop a freshly-opened socket if it sits idle, so we must send *IDN?
+    promptly rather than block up to `timeout` waiting for a banner that may never come.
+    """
     try:
         with socket.create_connection((ip, port), timeout=timeout) as s:
-            s.settimeout(timeout)
+            s.settimeout(0.15)                     # brief drain - don't sit idle before *IDN?
             try:                                   # drain any connect banner / prompt
                 s.recv(4096)
             except socket.timeout:
                 pass
+            s.settimeout(timeout)                  # now wait properly for the reply
             s.sendall(b"*IDN?\n")
             time.sleep(0.2)
             data = b""
@@ -76,8 +87,27 @@ def probe_idn(ip: str, port: int, timeout: float = 1.0) -> str:
 def is_scope(idn: str) -> bool:
     """True if the *IDN? reply is a Tektronix or Keysight oscilloscope (not an AFG etc.)."""
     up = idn.upper()
-    return (any(v in up for v in _SCOPE_VENDORS)
+    return (any(v in up for v in _INSTRUMENT_VENDORS)
             and any(fam in up for fam in _SCOPE_FAMILIES))
+
+
+def is_function_generator(idn: str) -> bool:
+    """True if the *IDN? reply is a Tektronix/Keysight function generator (AFG/AWG/33xxx)."""
+    up = idn.upper()
+    return (any(v in up for v in _INSTRUMENT_VENDORS)
+            and any(fam in up for fam in _AFG_FAMILIES))
+
+
+def device_kind(idn: str) -> str:
+    """Classify an *IDN? reply: 'scope' | 'afg' | 'instrument' (known vendor, unknown role)
+    | 'other' (no recognized vendor)."""
+    if is_scope(idn):
+        return "scope"
+    if is_function_generator(idn):
+        return "afg"
+    if any(v in idn.upper() for v in _INSTRUMENT_VENDORS):
+        return "instrument"
+    return "other"
 
 
 def _idn_model(idn: str) -> str:
@@ -87,16 +117,28 @@ def _idn_model(idn: str) -> str:
 
 
 def confirm(ip: str, ports: tuple[int, ...] = DEFAULT_PORTS,
-            timeout: float = 1.0) -> dict | None:
-    """Try each port on `ip`; return {ip, port, idn, model} for the first that identifies
-    as a Tektronix instrument, else None."""
+            timeout: float = 1.0, retries: int = 1) -> dict | None:
+    """Try each port on `ip`; return {ip, port, idn, model, kind} for the first that
+    identifies as a known instrument (any supported vendor - scope OR function generator),
+    else None.
+
+    An instrument occasionally does not answer a fast *IDN? probe in time (returns empty),
+    which would drop it from discovery. So when a port's socket opens but the reply is empty,
+    we retry a couple of times (with a slightly longer timeout) before giving up on it - a
+    reachable-but-silent host is exactly the case worth retrying.
+    """
     for port in ports:
-        idn = probe_idn(ip, port, timeout)
-        if "TEKTRONIX" in idn.upper():
-            # Keep the meaningful line (Terminal mode may echo the command / add a prompt).
-            line = next((ln.strip(" \t\r\n>") for ln in idn.replace("\r", "\n").split("\n")
-                         if "TEKTRONIX" in ln.upper()), idn.strip())
-            return {"ip": ip, "port": port, "idn": line, "model": _idn_model(line)}
+        for attempt in range(retries + 1):
+            idn = probe_idn(ip, port, timeout * (1 + attempt))   # lengthen the wait each retry
+            up = idn.upper()
+            if any(v in up for v in _INSTRUMENT_VENDORS):
+                # Keep the meaningful line (Terminal mode may echo the command / add a prompt).
+                line = next((ln.strip(" \t\r\n>") for ln in idn.replace("\r", "\n").split("\n")
+                             if any(v in ln.upper() for v in _INSTRUMENT_VENDORS)), idn.strip())
+                return {"ip": ip, "port": port, "idn": line,
+                        "model": _idn_model(line), "kind": device_kind(line)}
+            if idn.strip():
+                break            # got a non-empty reply that is not an instrument - move on
     return None
 
 
@@ -187,19 +229,76 @@ def local_subnets(prefix: int = 24) -> list[str]:
                    for ip in local_ipv4s()})
 
 
-def discover_scopes(port: int | None = None, subnet: str | None = None,
-                    scopes_only: bool = True, timeout: float = 0.5,
-                    ports: tuple[int, ...] = DEFAULT_PORTS) -> list[dict]:
-    """Find scopes by scanning the network and *IDN?-probing every host.
+def neighbor_ips() -> set[str]:
+    """IPv4 hosts the OS has already seen on the wire (its ARP/neighbor table).
 
-    For each reachable IP we open a socket and send *IDN?; whoever answers as a Tektronix
-    scope becomes a result (so you can open a session to each). This is the "detect IPs,
-    ping with *IDN?, keep the responders" approach.
-
-    port    : the single SCPI port to probe (you determine this). None = try the defaults.
-    subnet  : a CIDR like "192.168.1.0/24" to scan. None = auto-detect the local subnet(s).
-    Returns a list of {ip, port, idn, model} dicts, one per scope found.
+    This is the fast, reliable way to find instruments on a LINK-LOCAL (169.254.0.0/16)
+    bench: each device self-assigns a random address across the whole /16, so a /24 scan
+    almost always misses them - but any device that has exchanged a packet shows up here.
+    We then *IDN?-probe these candidates. Self IPs, multicast and broadcast are dropped.
     """
+    import re
+    import subprocess
+    try:
+        out = subprocess.run(["arp", "-a"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    mine = local_ipv4s()
+    ips: set[str] = set()
+    for ip in re.findall(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", out):
+        if (ip in mine or ip.endswith(".255")
+                or ip.startswith(("0.", "127.", "224.", "239.", "255."))
+                or ip == "169.254.169.254"):        # APIPA metadata pseudo-address
+            continue
+        ips.add(ip)
+    return ips
+
+
+# A small on-disk cache of IPs where instruments were last found. On a link-local (/16)
+# bench, ARP entries expire and devices sit on a different /24 than the PC, so neither the
+# neighbor table nor a /24 scan reliably finds them on a later run. Re-probing the last-known
+# IPs is fast and robust as long as the addresses are stable (they usually are).
+_IP_CACHE_FILE = os.path.join(_HERE, ".instrument_ips.json")
+
+
+def _load_cached_ips() -> set[str]:
+    try:
+        import json
+        with open(_IP_CACHE_FILE, encoding="utf-8") as fh:
+            return {str(ip) for ip in json.load(fh)}
+    except (OSError, ValueError):
+        return set()
+
+
+def _save_cached_ips(ips: set[str]) -> None:
+    try:
+        import json
+        with open(_IP_CACHE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(sorted(ips), fh)
+    except OSError:
+        pass
+
+
+def discover_instruments(port: int | None = None, subnet: str | None = None,
+                         timeout: float = 0.5, ports: tuple[int, ...] = DEFAULT_PORTS,
+                         kinds: tuple[str, ...] | None = None,
+                         use_neighbors: bool = True) -> list[dict]:
+    """Find ALL supported instruments (scopes AND function generators) by *IDN?-probing hosts.
+    This is the "detect IPs, ping with *IDN?, keep the responders" approach - it just doesn't
+    throw away the non-scopes. Two sources of candidate IPs, unioned:
+      1. a subnet scan (good for a normal /24 with static or DHCP addresses), and
+      2. the OS ARP/neighbor table (essential on a LINK-LOCAL /16 bench, where each device
+         self-assigns a random 169.254.x.x and a /24 scan would miss it).
+
+    port    : the single SCPI port to probe. None = try the defaults (4000 and 5025).
+    subnet  : a CIDR like "192.168.1.0/24" to scan. None = auto-detect the local subnet(s).
+    kinds   : optional filter, e.g. ("scope",) or ("scope", "afg"). None = keep everything.
+    use_neighbors : also probe IPs already in the ARP/neighbor table (recommended).
+    Returns a list of {ip, port, idn, model, kind} dicts, one per instrument found.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
     probe_ports = (int(port),) if port else tuple(ports)
     subnets = [subnet] if subnet else local_subnets()
     results: list[dict] = []
@@ -209,9 +308,40 @@ def discover_scopes(port: int | None = None, subnet: str | None = None,
             if info["ip"] not in seen:
                 results.append(info)
                 seen.add(info["ip"])
-    if scopes_only:
-        results = [r for r in results if is_scope(r["idn"])]
+
+    if use_neighbors:
+        # Probe the ARP/neighbor table AND the last-known cached IPs. The cache covers the case
+        # where an instrument's ARP entry has expired but its address is unchanged - common on a
+        # link-local bench, and exactly why an earlier run finds a device the next one misses.
+        extra = [ip for ip in (neighbor_ips() | _load_cached_ips()) if ip not in seen]
+        if extra:
+            with ThreadPoolExecutor(max_workers=min(64, len(extra))) as pool:
+                for info in pool.map(lambda ip: confirm(ip, probe_ports, timeout), extra):
+                    if info and info["ip"] not in seen:
+                        results.append(info)
+                        seen.add(info["ip"])
+
+    if results:                                   # remember where instruments answered
+        _save_cached_ips({r["ip"] for r in results})
+
+    if kinds:
+        keep = set(kinds)
+        results = [r for r in results if r.get("kind") in keep]
     return results
+
+
+def discover_scopes(port: int | None = None, subnet: str | None = None,
+                    scopes_only: bool = True, timeout: float = 0.5,
+                    ports: tuple[int, ...] = DEFAULT_PORTS) -> list[dict]:
+    """Find scopes by scanning the network and *IDN?-probing every host. A thin filter over
+    discover_instruments() kept for backward compatibility.
+
+    scopes_only=True keeps only oscilloscopes; False keeps every identified instrument.
+    Returns a list of {ip, port, idn, model, kind} dicts.
+    """
+    kinds = ("scope",) if scopes_only else None
+    return discover_instruments(port=port, subnet=subnet, timeout=timeout,
+                                ports=ports, kinds=kinds)
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +413,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--timeout", type=float, default=0.5,
                     help="Per-host connect timeout in seconds. Default 0.5.")
     ap.add_argument("--all", action="store_true",
-                    help="Keep all Tektronix instruments, not just oscilloscopes.")
+                    help="Keep every identified instrument (function generators too), "
+                         "not just oscilloscopes.")
     ap.add_argument("--open", action="store_true",
                     help="Open a session to every discovered scope and print each *IDN?.")
     return ap.parse_args(argv)
@@ -304,7 +435,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\nFound {len(found)} instrument(s):")
     for f in found:
-        print(f"  {f['ip']}:{f['port']}  {f['idn']}")
+        print(f"  {f['ip']}:{f['port']}  [{f.get('kind', '?')}]  {f['idn']}")
 
     if args.open:
         fleet = ScopeFleet.from_discovery(found)

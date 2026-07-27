@@ -65,33 +65,84 @@ def _ks_impedance(ohms: float) -> str:
 
 class SocketScope:
     """Minimal raw-socket SCPI client. Detects the vendor (Tektronix / Keysight) from
-    *IDN? at connect, so configure()/acquire() can send the right SCPI for that brand."""
+    *IDN? at connect, so configure()/acquire() can send the right SCPI for that brand.
+
+    A raw SCPI socket (port 5025) is dropped by the instrument when it sits idle - which is
+    exactly what happens between TestStand steps (configure ... then later capture). So every
+    query/write transparently reconnects and retries once if the socket has been closed
+    underneath us. The detected vendor is remembered across a reconnect (no re-detect)."""
 
     def __init__(self, host: str, port: int = 5025, timeout: float = 5.0) -> None:
-        self.sock = socket.create_connection((host, port), timeout=timeout)
-        self.sock.settimeout(1.0)      # per-read timeout used to detect "reply done"
+        self.host = host
+        self.port = int(port)
+        self.timeout = timeout
+        self.sock: socket.socket | None = None
+        self.vendor = "tektronix"      # provisional until the first connect detects it
+        self.idn = ""
+        self._last_io = 0.0
+        self._open(first=True)
+
+    # Per-read timeout used to detect "reply done" (a short silence ends a reply). Kept small
+    # because on a raw 5025 socket replies arrive in one burst; a bigger value just wastes a
+    # full timeout on every single query/write. Big transfers (CURVe?) stream continuously, so
+    # the end-of-reply gap is still detected correctly.
+    READ_TIMEOUT = 0.4
+    DRAIN_TIMEOUT = 0.12           # even shorter: after a write there is only fast echo (or none)
+    # If the socket has been idle longer than this, reconnect BEFORE sending. The instrument
+    # silently drops idle raw-socket connections, and a send on a half-open socket can succeed
+    # (data lost) without raising - so we can't rely on catching the error afterward. Proactive
+    # reconnect on idle avoids that race entirely (between TestStand steps, or while another
+    # instrument is being configured).
+    IDLE_RECONNECT = 5.0
+
+    def _open(self, first: bool = False) -> None:
+        """Open the socket and re-establish session state (vendor detect on first open only,
+        then headers off). Uses low-level _tell/_ask so it can't recurse into a reconnect."""
+        self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        self.sock.settimeout(self.READ_TIMEOUT)
         self._drain()                  # discard any connect-time banner / prompt
 
-        # Read the identity FIRST (works with headers on or off) and pick the vendor.
-        self.idn = self.query("*IDN?").strip()
-        self.vendor = detect_vendor(self.idn)
+        if first:
+            # Read the identity FIRST (works with headers on or off) and pick the vendor.
+            self.idn = self._ask("*IDN?").strip()
+            self.vendor = detect_vendor(self.idn)
 
         # Bare query responses. With headers ON a scope prefixes replies with the command
         # path (":WFMOUTPRE:XZERO -2.0E-3"), which float() can't parse - the classic
         # "could not convert string to float". Turn headers off with the vendor's command.
         if self.vendor == "keysight":
-            self.write(":SYSTem:HEADer OFF")
+            self._tell(":SYSTem:HEADer OFF")
         else:                          # tektronix (and unknown -> assume Tek-style)
-            self.write("HEADer OFF")
-            self.write("VERBose OFF")
+            self._tell("HEADer OFF")
+            self._tell("VERBose OFF")
+        self._last_io = time.monotonic()
+
+    def _reconnect(self) -> None:
+        """Re-open the socket after the instrument dropped an idle connection."""
+        try:
+            if self.sock is not None:
+                self.sock.close()
+        except OSError:
+            pass
+        self._open(first=False)         # keep the vendor already detected
+
+    def _ensure_fresh(self) -> None:
+        """Reconnect proactively if the socket has been idle long enough that the instrument
+        may have dropped it - so we never send on a half-open connection."""
+        if time.monotonic() - self._last_io > self.IDLE_RECONNECT:
+            self._reconnect()
 
     def _drain(self) -> None:
-        """Read and throw away whatever is already waiting (banner, stale prompt)."""
+        """Read and throw away whatever is already waiting (banner, stale prompt/echo).
+        Uses a very short timeout - there is only a fast Terminal-mode echo, or nothing."""
+        self.sock.settimeout(self.DRAIN_TIMEOUT)
         try:
             while self.sock.recv(4096):
                 pass
         except socket.timeout:
             pass
+        finally:
+            self.sock.settimeout(self.READ_TIMEOUT)
 
     def _read(self) -> str:
         """Read until the scope goes quiet (a short read-timeout marks the end)."""
@@ -106,10 +157,30 @@ class SocketScope:
             pass
         return b"".join(chunks).decode(errors="replace")
 
-    def query(self, cmd: str, *, debug: bool = False) -> str:
+    # --- Low-level send helpers used DURING connect (never reconnect - would recurse) -----
+    def _tell(self, cmd: str) -> None:
+        self.sock.sendall(cmd.encode() + b"\n")
+        time.sleep(0.1)
+        self._drain()
+
+    def _ask(self, cmd: str) -> str:
         self.sock.sendall(cmd.encode() + b"\n")
         time.sleep(0.2)
-        raw = self._read()
+        return _clean(self._read(), cmd)
+
+    # --- Public API - proactive idle reconnect + reactive retry once on a dropped socket ---
+    def query(self, cmd: str, *, debug: bool = False) -> str:
+        self._ensure_fresh()
+        try:
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.2)
+            raw = self._read()
+        except OSError:                # idle connection dropped - reconnect and retry once
+            self._reconnect()
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.2)
+            raw = self._read()
+        self._last_io = time.monotonic()
         if debug:
             print(f"  raw reply: {raw!r}", file=sys.stderr)
         return _clean(raw, cmd)
@@ -117,17 +188,35 @@ class SocketScope:
     def query_raw(self, cmd: str) -> str:
         """Return the FULL reply, uncleaned — for big replies (a curve) that may
         arrive wrapped across many lines in Terminal mode."""
-        self.sock.sendall(cmd.encode() + b"\n")
-        time.sleep(0.2)
-        return self._read()
+        self._ensure_fresh()
+        try:
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.2)
+            raw = self._read()
+        except OSError:                # idle connection dropped - reconnect and retry once
+            self._reconnect()
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.2)
+            raw = self._read()
+        self._last_io = time.monotonic()
+        return raw
 
     def write(self, cmd: str) -> None:
-        self.sock.sendall(cmd.encode() + b"\n")
-        time.sleep(0.1)
-        self._drain()
+        self._ensure_fresh()
+        try:
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.1)
+            self._drain()
+        except OSError:                # idle connection dropped - reconnect and retry once
+            self._reconnect()
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.1)
+            self._drain()
+        self._last_io = time.monotonic()
 
     def close(self) -> None:
-        self.sock.close()
+        if self.sock is not None:
+            self.sock.close()
 
 
 def _clean(raw: str, cmd: str) -> str:
@@ -1005,9 +1094,15 @@ def _render_png(waves: dict[int, Waveform], path: str) -> None:
     cv.save(path)
 
 
-def _write_png(waves: dict[int, Waveform], path: str) -> bool:
-    """Write a PNG of one or more waveforms. Always succeeds - matplotlib optional."""
+def _write_png(waves: dict[int, Waveform], path: str, label: str = "") -> bool:
+    """Write a PNG of one or more waveforms. Always succeeds - matplotlib optional.
+
+    label : an optional source name (e.g. a scope alias) shown in the plot title, so an
+            opened PNG says WHICH instrument it came from.
+    """
     chans = sorted(waves)
+    channels = ", ".join(waves[c].channel for c in chans)
+    title = f"{label}: {channels}" if label else f"Capture: {channels}"
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -1023,7 +1118,7 @@ def _write_png(waves: dict[int, Waveform], path: str) -> bool:
         plt.plot(waves[c].t, waves[c].v, linewidth=0.8, label=waves[c].channel)
     plt.xlabel("time (s)")
     plt.ylabel("volts")
-    plt.title("Capture: " + ", ".join(waves[c].channel for c in chans))
+    plt.title(title)
     if len(chans) > 1:
         plt.legend()
     plt.grid(True, alpha=0.3)
@@ -1033,9 +1128,10 @@ def _write_png(waves: dict[int, Waveform], path: str) -> bool:
     return True
 
 
-def save_png(wf: Waveform, path: str) -> bool:
-    """Save a PNG plot of one waveform. Works with or without matplotlib."""
-    return _write_png({_channel_number(wf.channel): wf}, path)
+def save_png(wf: Waveform, path: str, label: str = "") -> bool:
+    """Save a PNG plot of one waveform. Works with or without matplotlib. `label` names the
+    source (e.g. a scope alias) in the plot title."""
+    return _write_png({_channel_number(wf.channel): wf}, path, label)
 
 
 # ---------------------------------------------------------------------------
@@ -1075,6 +1171,47 @@ def acquire_many(scope: SocketScope, channels: list[int],
     finally:
         if was_running:
             scope.write("ACQuire:STATE RUN")   # leave the scope as we found it (live)
+    return waves
+
+
+def capture_live(scope: SocketScope, channels: list[int],
+                 points: int = 1000, settle: float = 1.0) -> dict[int, Waveform]:
+    """Force a fresh, frozen record and read every channel off it - vendor-aware.
+
+    Puts the scope in AUTO (self-trigger) so a record fills even when nothing satisfies the
+    configured trigger (e.g. a NORMal edge that never arrives, or a flat input), waits `settle`
+    for it to acquire, STOPs to freeze that one record, reads every channel from it, then
+    leaves the scope live again. This is what makes capture work on a Keysight configured with
+    a NORMal trigger, where simply reading the current record returns an empty preamble.
+
+    Tektronix uses ACQuire:STATE / TRIGger:A:MODe; Keysight uses :RUN/:STOP / :TRIGger:SWEep.
+    """
+    ks = getattr(scope, "vendor", "tektronix") == "keysight"
+    if ks:
+        scope.write(":TRIGger:SWEep AUTO")        # self-trigger; don't wait for an edge
+        scope.write(":RUN")
+        time.sleep(settle)
+        scope.write(":STOP")                       # freeze one record for a coherent read
+    else:
+        scope.write("TRIGger:A:MODe AUTO")
+        scope.write("ACQuire:STOPAfter RUNSTop")   # continuous, not single-sequence
+        scope.write("ACQuire:STATE RUN")
+        time.sleep(settle)
+        scope.write("ACQuire:STATE STOP")
+    try:
+        waves: dict[int, Waveform] = {}
+        for ch in channels:
+            wf = acquire(scope, ch, points)
+            if wf is None:
+                print(f"CH{ch}: no curve data - is the channel displayed and acquiring?",
+                      file=sys.stderr)
+                continue
+            waves[ch] = wf
+    finally:
+        if ks:
+            scope.write(":RUN")                    # leave the scope live
+        else:
+            scope.write("ACQuire:STATE RUN")
     return waves
 
 
@@ -1135,12 +1272,13 @@ def ascii_plot_joint(waves: dict[int, Waveform], width: int = 70, height: int = 
     print(f"             {legend}")
 
 
-def save_png_joint(waves: dict[int, Waveform], path: str) -> bool:
+def save_png_joint(waves: dict[int, Waveform], path: str, label: str = "") -> bool:
     """One PNG with every channel overlaid on a shared voltage axis, with a legend.
+    `label` names the source (e.g. a scope alias) in the plot title.
 
     Works with or without matplotlib (falls back to the built-in renderer).
     """
-    return _write_png(waves, path)
+    return _write_png(waves, path, label)
 
 
 # ---------------------------------------------------------------------------

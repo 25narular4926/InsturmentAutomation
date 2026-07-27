@@ -46,23 +46,69 @@ from typing import Any
 # Transport - the same raw-socket SCPI client the scope library uses.
 # ---------------------------------------------------------------------------
 class SocketAFG:
-    """Minimal raw-socket SCPI client for the Tektronix Socket Server (Terminal mode)."""
+    """Minimal raw-socket SCPI client for a Tektronix AFG over its SCPI socket.
+
+    Works on the port-4000 Socket Server (Terminal mode, which echoes) and on the raw LXI
+    SCPI port 5025 (no echo). The AFG drops idle raw-socket connections, so every write/query
+    transparently reconnects and retries once if the socket has been closed underneath us -
+    which is what happens when an instrument sits idle between TestStand steps.
+    """
 
     def __init__(self, host: str, port: int = 4000, timeout: float = 5.0) -> None:
-        self.sock = socket.create_connection((host, port), timeout=timeout)
-        self.sock.settimeout(1.0)      # per-read timeout used to detect "reply done"
+        self.host = host
+        self.port = int(port)
+        self.timeout = timeout
+        self.sock: socket.socket | None = None
+        self._last_io = 0.0
+        self._connect()
+
+    # Per-read timeout used to detect "reply done" (a short silence ends a reply). Small on
+    # purpose: on a raw 5025 socket replies arrive in one burst, so a bigger value just wastes
+    # a full timeout on every query/write.
+    READ_TIMEOUT = 0.4
+    DRAIN_TIMEOUT = 0.12           # after a write there is only fast echo (or none)
+    # If the socket has been idle longer than this, reconnect BEFORE sending. The AFG silently
+    # drops idle connections, and a send on a half-open socket can succeed (data lost) without
+    # raising - proactive reconnect on idle avoids that race (e.g. while a scope is configured).
+    IDLE_RECONNECT = 5.0
+
+    def _connect(self) -> None:
+        self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        self.sock.settimeout(self.READ_TIMEOUT)
         self._drain()                  # discard any connect-time banner / prompt
         # Bare query responses: HEADer OFF strips the ":SOURCE1:FREQUENCY " prefix so
         # replies are plain values that float() can parse. VERBose OFF keeps them terse.
-        self.write("HEADer OFF")
-        self.write("VERBose OFF")
+        # Sent raw (not via write()) so a failure here can't recurse into a reconnect.
+        for setup in (b"HEADer OFF\n", b"VERBose OFF\n"):
+            self.sock.sendall(setup)
+            time.sleep(0.1)
+            self._drain()
+        self._last_io = time.monotonic()
+
+    def _reconnect(self) -> None:
+        """Re-open the socket after the AFG dropped an idle connection."""
+        try:
+            if self.sock is not None:
+                self.sock.close()
+        except OSError:
+            pass
+        self._connect()
+
+    def _ensure_fresh(self) -> None:
+        """Reconnect proactively if the socket has been idle long enough that the AFG may have
+        dropped it - so we never send on a half-open connection."""
+        if time.monotonic() - self._last_io > self.IDLE_RECONNECT:
+            self._reconnect()
 
     def _drain(self) -> None:
+        self.sock.settimeout(self.DRAIN_TIMEOUT)
         try:
             while self.sock.recv(4096):
                 pass
         except socket.timeout:
             pass
+        finally:
+            self.sock.settimeout(self.READ_TIMEOUT)
 
     def _read(self) -> str:
         chunks: list[bytes] = []
@@ -77,20 +123,37 @@ class SocketAFG:
         return b"".join(chunks).decode(errors="replace")
 
     def query(self, cmd: str, *, debug: bool = False) -> str:
-        self.sock.sendall(cmd.encode() + b"\n")
-        time.sleep(0.2)
-        raw = self._read()
+        self._ensure_fresh()
+        try:
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.2)
+            raw = self._read()
+        except OSError:                # idle connection dropped - reconnect and retry once
+            self._reconnect()
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.2)
+            raw = self._read()
+        self._last_io = time.monotonic()
         if debug:
             print(f"  raw reply: {raw!r}", file=sys.stderr)
         return _clean(raw, cmd)
 
     def write(self, cmd: str) -> None:
-        self.sock.sendall(cmd.encode() + b"\n")
-        time.sleep(0.1)
-        self._drain()
+        self._ensure_fresh()
+        try:
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.1)
+            self._drain()
+        except OSError:                # idle connection dropped - reconnect and retry once
+            self._reconnect()
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.1)
+            self._drain()
+        self._last_io = time.monotonic()
 
     def close(self) -> None:
-        self.sock.close()
+        if self.sock is not None:
+            self.sock.close()
 
 
 def _clean(raw: str, cmd: str) -> str:
