@@ -1,0 +1,21 @@
+{
+  "_comment": "Read a steady EXTERNAL DC voltage on CH1 (from the ECM, a supply, a battery, etc.). DC coupling is essential (AC coupling would strip the level away). AUTO trigger because a flat line has no edge to trigger on. The timebase is irrelevant for DC, so a fast 1 ms/div is fine; the level is taken as the mean over the record. CH1 5 V/div covers roughly +/-20 V, enough for automotive levels (e.g. 14 V). For small logic levels (3.3 / 5 V) drop the scale for finer resolution; for higher voltages raise it. 1 MOhm input so it is safe well beyond 20 V.",
+  "name": "dc_read",
+
+  "horizontal_mode": "MANual",
+  "sample_rate": 100000,
+  "horizontal_scale": 0.001,
+  "record_length": 1000,
+  "horizontal_position": 50.0,
+  "acquire_mode": "SAMple",
+
+  "trigger_mode": "AUTO",
+  "trigger_source": "CH1",
+  "trigger_level": 0.0,
+  "trigger_slope": "RISE",
+
+  "default_channel": { "scale": 5.0, "offset": 0.0, "coupling": "DC", "termination": 1e6 },
+  "channels": {
+    "1": { "scale": 5.0, "offset": 0.0, "coupling": "DC", "termination": 1e6 }
+  }
+}
