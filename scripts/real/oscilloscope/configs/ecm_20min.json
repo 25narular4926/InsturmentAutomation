@@ -1,0 +1,21 @@
+{
+  "_comment": "20-minute (1200 s) single-shot capture of a slow ECM waveform. horizontal_scale 120 s/div x 10 divisions = 1200 s across the screen. A low sample rate (10 S/s) is plenty for a 1 mHz signal and keeps the record small (10 S/s x 1200 s = 12000 pts). AUTO trigger so the acquisition starts immediately (little delay). NOTE: 120 s/div exceeds the Keysight DSO-X 3034G max (50 s/div) - use the Tektronix MSO24 for this capture. CH1: 1.5 V/div DC 1 MOhm.",
+  "name": "ecm_20min",
+
+  "horizontal_mode": "MANual",
+  "sample_rate": 10,
+  "horizontal_scale": 120.0,
+  "record_length": 12000,
+  "horizontal_position": 0.0,
+  "acquire_mode": "SAMple",
+
+  "trigger_mode": "AUTO",
+  "trigger_source": "CH1",
+  "trigger_level": 2.5,
+  "trigger_slope": "RISE",
+
+  "default_channel": { "scale": 1.5, "offset": 0.0, "coupling": "DC", "termination": 1e6 },
+  "channels": {
+    "1": { "scale": 1.5, "offset": 0.0, "coupling": "DC", "termination": 1e6 }
+  }
+}

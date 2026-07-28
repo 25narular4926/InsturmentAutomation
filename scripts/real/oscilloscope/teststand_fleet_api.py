@@ -447,6 +447,11 @@ def get_pulse_width(alias: str, channel: int = 1) -> float:
     return bs.measure_pulse_width(_require_wave(alias, int(channel)))
 
 
+def get_pulse_width_negative(alias: str, channel: int = 1) -> float:
+    """Negative (low) pulse width in seconds (first pulse). 0.0 if flat / no complete pulse."""
+    return bs.measure_pulse_width_negative(_require_wave(alias, int(channel)))
+
+
 def get_sample_count(alias: str, channel: int = 1) -> int:
     """How many samples were transferred."""
     return int(len(_require_wave(alias, int(channel)).v))

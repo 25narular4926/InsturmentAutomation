@@ -833,6 +833,40 @@ def measure_pulse_width(wf: Waveform) -> float:
     return 0.0                                # no complete positive pulse in the record
 
 
+def measure_pulse_width_negative(wf: Waveform) -> float:
+    """Negative (low) pulse width in seconds: how long the FIRST low pulse stays low.
+
+    The mirror of measure_pulse_width(): same robust 10/90-percentile levels, midpoint
+    threshold, and 10% hysteresis, but measured from the first falling crossing to the
+    following rising crossing. Returns 0.0 if the signal is flat or no complete low pulse
+    is found.
+    """
+    v, t = wf.v, wf.t
+    n = len(v)
+    if n < 2:
+        return 0.0
+    s = sorted(v)
+    v_low = _percentile(s, 10.0)
+    v_high = _percentile(s, 90.0)
+    span = v_high - v_low
+    if span <= 0:
+        return 0.0                           # flat signal - no pulse
+    mid = (v_low + v_high) / 2.0
+    hi_th = mid + 0.1 * span
+    lo_th = mid - 0.1 * span
+    state_high = v[0] >= mid
+    fall_t: float | None = None
+    for i in range(1, n):
+        if state_high and v[i] < lo_th:
+            state_high = False
+            fall_t = _cross_time(t, v, i, mid)
+        elif not state_high and v[i] > hi_th:
+            state_high = True
+            if fall_t is not None:
+                return float(_cross_time(t, v, i, mid) - fall_t)
+    return 0.0                                # no complete negative pulse in the record
+
+
 # --- CSV formatting -------------------------------------------------------
 # One place that decides how numbers look, so every CSV (per-channel and joint)
 # is formatted identically and the columns line up.

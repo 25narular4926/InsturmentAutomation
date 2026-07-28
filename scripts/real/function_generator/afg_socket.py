@@ -197,6 +197,7 @@ class ChannelWaveform:
     amplitude: float | None = None    # Vpp
     offset: float | None = None       # volts
     duty_cycle: float | None = None   # percent (pulse/square)
+    symmetry: float | None = None     # percent (RAMP); 50 = symmetric triangle, 100/0 = sawtooth
     phase: float | None = None        # degrees
     impedance: float | None = None    # output load in ohms (50), or use "INF" for high-Z
 
@@ -211,7 +212,7 @@ class WaveformSetup:
 CONFIGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
 
 _CHANNEL_FIELDS = ("shape", "frequency", "amplitude", "offset", "duty_cycle",
-                   "phase", "impedance")
+                   "symmetry", "phase", "impedance")
 
 
 def _channel_from_dict(d: dict) -> ChannelWaveform:
@@ -295,6 +296,8 @@ def configure(afg: SocketAFG, setup: WaveformSetup,
         src = f"SOURce{n}"
         if cw.shape:
             apply(f"{src}:FUNCtion:SHAPe", cw.shape)
+        if cw.symmetry is not None:
+            apply(f"{src}:FUNCtion:RAMP:SYMMetry", cw.symmetry)   # 50% = triangle
         if cw.frequency is not None:
             apply(f"{src}:FREQuency", cw.frequency)
         if cw.amplitude is not None:
