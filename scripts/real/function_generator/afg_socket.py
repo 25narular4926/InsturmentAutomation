@@ -196,8 +196,8 @@ class ChannelWaveform:
     frequency: float | None = None    # Hz
     amplitude: float | None = None    # Vpp
     offset: float | None = None       # volts
-    duty_cycle: float | None = None   # percent (pulse/square)
-    symmetry: float | None = None     # percent (RAMP); 50 = symmetric triangle, 100/0 = sawtooth
+    duty_cycle: float | None = None   # percent. PULSe/SQUare: high-time duty. RAMP: rise
+                                      # symmetry (50 = symmetric triangle, 100/0 = sawtooth).
     phase: float | None = None        # degrees
     impedance: float | None = None    # output load in ohms (50), or use "INF" for high-Z
 
@@ -212,7 +212,7 @@ class WaveformSetup:
 CONFIGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
 
 _CHANNEL_FIELDS = ("shape", "frequency", "amplitude", "offset", "duty_cycle",
-                   "symmetry", "phase", "impedance")
+                   "phase", "impedance")
 
 
 def _channel_from_dict(d: dict) -> ChannelWaveform:
@@ -296,8 +296,11 @@ def configure(afg: SocketAFG, setup: WaveformSetup,
         src = f"SOURce{n}"
         if cw.shape:
             apply(f"{src}:FUNCtion:SHAPe", cw.shape)
-        if cw.symmetry is not None:
-            apply(f"{src}:FUNCtion:RAMP:SYMMetry", cw.symmetry)   # 50% = triangle
+        if cw.impedance is not None:
+            # Set the LOAD first. The AFG interprets amplitude/offset RELATIVE to the load,
+            # so if the load changes afterwards it rescales them (e.g. doubling for high-Z),
+            # and the read-back no longer matches what we set.
+            apply(f"OUTPut{n}:IMPedance", cw.impedance)      # 50, or INFinity for high-Z
         if cw.frequency is not None:
             apply(f"{src}:FREQuency", cw.frequency)
         if cw.amplitude is not None:
@@ -305,11 +308,12 @@ def configure(afg: SocketAFG, setup: WaveformSetup,
         if cw.offset is not None:
             apply(f"{src}:VOLTage:OFFSet", cw.offset)
         if cw.duty_cycle is not None:
-            apply(f"{src}:PULSe:DCYCle", cw.duty_cycle)      # pulse/square duty
+            if (cw.shape or "").upper().startswith("RAMP"):
+                apply(f"{src}:FUNCtion:RAMP:SYMMetry", cw.duty_cycle)  # triangle/ramp symmetry
+            else:
+                apply(f"{src}:PULSe:DCYCle", cw.duty_cycle)            # pulse/square duty
         if cw.phase is not None:
             apply(f"{src}:PHASe:ADJust", cw.phase)           # degrees
-        if cw.impedance is not None:
-            apply(f"OUTPut{n}:IMPedance", cw.impedance)      # 50, or INF for high-Z
 
     return settings
 
@@ -325,6 +329,13 @@ def _matches(expected: Any, readback: str) -> bool:
         return abs(got - float(expected)) <= 1e-9 + 1e-3 * abs(float(expected))
     exp_s = str(expected).strip().strip('"').upper()
     got_s = text.upper()
+    if exp_s.startswith("INF"):
+        # A high-Z ("INFinity") load reads back either as "INF..." or as a huge number
+        # (the AFG reports infinity as e.g. 9.9E37), so accept both.
+        try:
+            return abs(float(text)) >= 1e30
+        except ValueError:
+            return got_s.startswith("INF")
     return exp_s == got_s or exp_s.startswith(got_s) or got_s.startswith(exp_s)
 
 

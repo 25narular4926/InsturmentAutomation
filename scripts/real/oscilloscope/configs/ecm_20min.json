@@ -4,9 +4,9 @@
 
   "horizontal_mode": "MANual",
   "sample_rate": 10,
-  "horizontal_scale": 120.0,
-  "record_length": 12000,
-  "horizontal_position": 0.0,
+  "horizontal_scale": 100.0,
+  "record_length": 10000,
+  "horizontal_position": 10.0,
   "acquire_mode": "SAMple",
 
   "trigger_mode": "AUTO",
@@ -14,8 +14,8 @@
   "trigger_level": 2.5,
   "trigger_slope": "RISE",
 
-  "default_channel": { "scale": 1.5, "offset": 0.0, "coupling": "DC", "termination": 1e6 },
+  "default_channel": { "scale": 1.0, "offset": 0.0, "position": -3.5, "coupling": "DC", "termination": 1e6 },
   "channels": {
-    "1": { "scale": 1.5, "offset": 0.0, "coupling": "DC", "termination": 1e6 }
+    "1": { "scale": 1.0, "offset": 0.0, "position": -3.5, "coupling": "DC", "termination": 1e6 }
   }
 }

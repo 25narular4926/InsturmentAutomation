@@ -240,6 +240,8 @@ class ChannelSetup:
     """Vertical settings — these are PER CHANNEL, so each channel can differ."""
     scale: float | None = None        # volts/div
     offset: float | None = None       # volts
+    position: float | None = None     # vertical position in DIVISIONS (Tek CH:POSition;
+                                      # +up, -down). Distinct from offset (volts).
     coupling: str | None = None       # DC | AC | DCREJ
     termination: float | None = None  # input impedance in ohms: 1e6 (1 MOhm) or 50
     bandwidth: float | None = None    # input bandwidth limit in Hz, e.g. 500e6
@@ -296,7 +298,7 @@ class ScopeSetup:
 # ---------------------------------------------------------------------------
 CONFIGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
 
-_CHANNEL_FIELDS = ("scale", "offset", "coupling", "termination", "bandwidth")
+_CHANNEL_FIELDS = ("scale", "offset", "position", "coupling", "termination", "bandwidth")
 _SETUP_FIELDS = ("horizontal_mode", "sample_rate", "horizontal_scale", "record_length",
                  "horizontal_position", "acquire_mode", "trigger_mode", "trigger_source",
                  "trigger_level", "trigger_slope")
@@ -416,6 +418,8 @@ def configure(scope: SocketScope, setup: ScopeSetup,
                 apply(f":{ch}:SCALe", cs.scale)
             if cs.offset is not None:
                 apply(f":{ch}:OFFSet", cs.offset)
+            # position: Keysight has no divisions-based vertical position (it uses OFFSet in
+            # volts), so a `position` field is left to the Tektronix branch below.
             if cs.coupling:
                 apply(f":{ch}:COUPling", _KS_COUPLING.get(cs.coupling.upper(), cs.coupling))
             if cs.termination:
@@ -429,6 +433,8 @@ def configure(scope: SocketScope, setup: ScopeSetup,
                 apply(f"{ch}:SCAle", cs.scale)
             if cs.offset is not None:
                 apply(f"{ch}:OFFSet", cs.offset)
+            if cs.position is not None:
+                apply(f"{ch}:POSition", cs.position)        # vertical position in divisions
             if cs.coupling:
                 apply(f"{ch}:COUPling", cs.coupling)
             if cs.termination:
