@@ -1,0 +1,34 @@
+{
+  "_comment": "Use-case config 3. RMS voltage on CH1, automatic trigger. CH1 2 V/div (use 5 for 24 V calibrations). Plain numbers in the scope's native units: horizontal_scale in SECONDS (0.002 = 2 ms/div, 2.0 = 2 s/div), vertical_scale in V/div, vertical_position in divisions, trigger_position in %, record_length in points, trigger_level in volts (or \"half_battery\" = half of battery_voltage). sample_rate is derived from record_length + horizontal_scale when null.",
+  "name": "3",
+  "record_length": 10000,
+  "horizontal_scale": 0.004,
+  "trigger_position": 10,
+  "sample_rate": null,
+  "trigger_source": "CH1",
+  "trigger_type": "EDGE",
+  "trigger_slope": "RISE",
+  "trigger_level": "half_battery",
+  "trigger_mode": "AUTO",
+  "battery_voltage": 12,
+  "acquire_mode": "SAMple",
+  "measurement": "rms",
+  "channels": {
+    "1": {
+      "input_coupling": "DC",
+      "vertical_scale": 2.0,
+      "vertical_position": -3.5,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    },
+    "2": {
+      "input_coupling": null,
+      "vertical_scale": null,
+      "vertical_position": null,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    }
+  }
+}

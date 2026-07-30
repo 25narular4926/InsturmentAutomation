@@ -1,23 +1,32 @@
 {
   "_comment": "1 mHz triangle for a 20-minute ECM sweep. RAMP shape; for a ramp the duty_cycle is the rise SYMMETRY - 50 = a symmetric triangle (rises half the period, falls half), 100 = rising sawtooth, 0 = falling sawtooth. frequency 0.001 Hz -> period 1000 s (16.7 min), so a 20-minute run covers ~1.2 cycles. 4 Vpp on a 2.5 V offset -> a 0.5..4.5 V automotive-style sweep. INFinity load matches a high-impedance ECM input / 1 MOhm scope. Output stays OFF until output_on.",
   "name": "triangle_1mhz",
-
   "default_channel": {
     "shape": "RAMP",
-    "duty_cycle": 50,
     "frequency": 0.001,
     "amplitude": 4.0,
     "offset": 2.5,
-    "impedance": "INFinity"
+    "duty_cycle": 50.0,
+    "phase": null,
+    "impedance": "INFinity",
+    "pulse_rate": null,
+    "pulse_width": null,
+    "pulse_high_voltage": null,
+    "pulse_low_voltage": null
   },
   "channels": {
     "1": {
       "shape": "RAMP",
-      "duty_cycle": 50,
       "frequency": 0.001,
       "amplitude": 4.0,
       "offset": 2.5,
-      "impedance": "INFinity"
+      "duty_cycle": 50.0,
+      "phase": null,
+      "impedance": "INFinity",
+      "pulse_rate": null,
+      "pulse_width": null,
+      "pulse_high_voltage": null,
+      "pulse_low_voltage": null
     }
   }
 }

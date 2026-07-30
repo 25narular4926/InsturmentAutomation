@@ -275,8 +275,11 @@ class ScopeSetup:
     #            what you want when arming with --single to catch a specific event.
     trigger_mode: str | None = None          # AUTO | NORMal
     trigger_source: str | None = None
-    trigger_level: float | None = None       # volts
+    trigger_type: str | None = None          # EDGE (the only type supported)
+    trigger_level: float | None = None       # volts (or "half_battery" -> battery_voltage/2)
     trigger_slope: str | None = None         # RISE | FALL
+    battery_voltage: float | None = None     # volts; used to resolve trigger_level "half_battery"
+    measurement: Any = None                  # what the test measures (metadata: "rms", "delay", ...)
 
 
 # ---------------------------------------------------------------------------
@@ -301,20 +304,105 @@ CONFIGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs"
 _CHANNEL_FIELDS = ("scale", "offset", "position", "coupling", "termination", "bandwidth")
 _SETUP_FIELDS = ("horizontal_mode", "sample_rate", "horizontal_scale", "record_length",
                  "horizontal_position", "acquire_mode", "trigger_mode", "trigger_source",
-                 "trigger_level", "trigger_slope")
+                 "trigger_type", "trigger_level", "trigger_slope", "battery_voltage",
+                 "measurement")
+
+# Spec-vocabulary aliases -> the canonical field name (so a config can read like the STP).
+_CHANNEL_ALIASES = {"vertical_scale": "scale", "vertical_resolution": "scale",
+                    "vertical_position": "position", "input_coupling": "coupling"}
+_SETUP_ALIASES = {"trigger_position": "horizontal_position"}
+
+# How each field's value is interpreted when it carries a unit string.
+_CHANNEL_KINDS = {"scale": "voltage", "offset": "voltage", "position": "number",
+                  "termination": "ohm", "bandwidth": "freq"}
+_SETUP_KINDS = {"sample_rate": "number", "horizontal_scale": "time", "record_length": "int",
+                "horizontal_position": "number", "trigger_level": "voltage",
+                "battery_voltage": "voltage"}
+
+
+def _parse_value(value: Any, kind: str | None):
+    """Coerce a config value to the type the scope expects. Plain numbers only, in the scope's
+    native units (horizontal_scale in seconds, scale in V/div, position in divisions, etc.)."""
+    if value is None:
+        return value
+    if kind == "ohm":
+        if isinstance(value, str) and "inf" in value.lower():
+            return "INFinity"
+        return float(value)
+    if kind == "int":
+        return int(round(float(value)))
+    return float(value)
+
+
+def _norm_enum(value: Any, kind: str) -> Any:
+    """Accept the STP's words for an enum (case-insensitive) and return the canonical value."""
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    if kind == "coupling":
+        return "DC" if v.startswith("dc") else "AC" if v.startswith("ac") else str(value).upper()
+    if kind == "slope":
+        if "ris" in v or "pos" in v:
+            return "RISE"
+        if "fall" in v or "neg" in v:
+            return "FALL"
+        return str(value).upper()
+    if kind == "mode":
+        return ("NORMal" if v.startswith("norm") else "AUTO" if v.startswith("auto")
+                else str(value).upper())
+    if kind == "source":
+        digits = "1" if "one" in v else "2" if "two" in v else "".join(c for c in v if c.isdigit())
+        return f"CH{digits}" if digits else str(value).upper()
+    if kind == "type":
+        return "EDGE"                                     # only Edge is supported
+    return value
 
 
 def _channel_from_dict(d: dict) -> ChannelSetup:
-    return ChannelSetup(**{k: d[k] for k in _CHANNEL_FIELDS if d.get(k) is not None})
+    out: dict[str, Any] = {}
+    for key, val in d.items():
+        canon = _CHANNEL_ALIASES.get(key, key)
+        if canon not in _CHANNEL_FIELDS or val is None:
+            continue
+        out[canon] = _norm_enum(val, "coupling") if canon == "coupling" \
+            else _parse_value(val, _CHANNEL_KINDS.get(canon))
+    return ChannelSetup(**out)
 
 
 def _setup_from_dict(data: dict, fallback_name: str) -> ScopeSetup:
     channels = {int(n): _channel_from_dict(cs)
                 for n, cs in (data.get("channels") or {}).items()}
     default_channel = _channel_from_dict(data.get("default_channel") or {})
-    kwargs = {k: data[k] for k in _SETUP_FIELDS if data.get(k) is not None}
-    return ScopeSetup(name=data.get("name") or fallback_name,
-                      channels=channels, default_channel=default_channel, **kwargs)
+
+    kwargs: dict[str, Any] = {}
+    _enum = {"trigger_slope": "slope", "trigger_mode": "mode", "trigger_source": "source",
+             "trigger_type": "type"}
+    for key, val in data.items():
+        canon = _SETUP_ALIASES.get(key, key)
+        if canon not in _SETUP_FIELDS or val is None:
+            continue
+        if canon in _enum:
+            kwargs[canon] = _norm_enum(val, _enum[canon])
+        elif canon in ("horizontal_mode", "acquire_mode", "measurement", "trigger_level"):
+            kwargs[canon] = val                           # trigger_level resolved below
+        else:
+            kwargs[canon] = _parse_value(val, _SETUP_KINDS.get(canon))
+
+    # Resolve trigger_level: a number/voltage string, or "half_battery" -> battery_voltage/2.
+    batt = kwargs.get("battery_voltage")
+    tl = kwargs.get("trigger_level")
+    if isinstance(tl, str):
+        if "batt" in tl.lower() or "half" in tl.lower():
+            kwargs["trigger_level"] = (batt / 2) if batt is not None else None
+        else:
+            kwargs["trigger_level"] = _parse_value(tl, "voltage")
+
+    setup = ScopeSetup(name=data.get("name") or fallback_name,
+                       channels=channels, default_channel=default_channel, **kwargs)
+    # Derive the sample rate when it isn't given (the STP lists record length + h-scale).
+    if setup.sample_rate is None and setup.record_length and setup.horizontal_scale:
+        setup.sample_rate = setup.record_length / (setup.horizontal_scale * 10)
+    return setup
 
 
 def load_setups(configs_dir: str = CONFIGS_DIR) -> dict[str, ScopeSetup]:

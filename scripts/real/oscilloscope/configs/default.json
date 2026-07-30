@@ -1,21 +1,34 @@
 {
   "_comment": "Generic fast-timebase default. Edit any value and re-run; the script loads this at startup. Keys set to null (or omitted) are left untouched on the scope.",
   "name": "default",
-
-  "sample_rate": 1.25e9,
   "record_length": 100000,
-  "horizontal_mode": null,
   "horizontal_scale": null,
-  "horizontal_position": 10.0,
-  "acquire_mode": null,
-
-  "trigger_mode": null,
+  "trigger_position": 10.0,
+  "sample_rate": 1250000000.0,
   "trigger_source": "CH1",
-  "trigger_level": 1.0,
+  "trigger_type": "EDGE",
   "trigger_slope": "RISE",
-
-  "default_channel": { "scale": 0.5, "offset": 0.0, "coupling": "DC" },
+  "trigger_level": 1.0,
+  "trigger_mode": null,
+  "battery_voltage": null,
+  "acquire_mode": "SAMple",
+  "measurement": null,
   "channels": {
-    "1": { "scale": 0.5, "offset": 0.0, "coupling": "DC" }
+    "1": {
+      "input_coupling": "DC",
+      "vertical_scale": 0.5,
+      "vertical_position": null,
+      "offset": 0.0,
+      "termination": null,
+      "bandwidth": null
+    },
+    "2": {
+      "input_coupling": null,
+      "vertical_scale": null,
+      "vertical_position": null,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    }
   }
 }

@@ -1,0 +1,34 @@
+{
+  "_comment": "TEMPLATE - copy this file, rename it, and fill in the values from your test. Leave any setting null if unused. Plain numbers in the scope's native units: horizontal_scale in SECONDS (0.002 = 2 ms/div, 2.0 = 2 s/div), vertical_scale in V/div, vertical_position in divisions, trigger_position in %, record_length in points, trigger_level in volts (or \"half_battery\" = half of battery_voltage). sample_rate is derived from record_length + horizontal_scale when null. Enum values: trigger_source \"CH1\"/\"CH2\", trigger_slope \"RISE\"/\"FALL\", trigger_mode \"NORMal\"/\"AUTO\", input_coupling \"DC\"/\"AC\". measurement is metadata: \"rms\"/\"delay\"/\"pulse_width\".",
+  "name": "template",
+  "record_length": null,
+  "horizontal_scale": null,
+  "trigger_position": null,
+  "sample_rate": null,
+  "trigger_source": null,
+  "trigger_type": "EDGE",
+  "trigger_slope": null,
+  "trigger_level": null,
+  "trigger_mode": null,
+  "battery_voltage": null,
+  "acquire_mode": "SAMple",
+  "measurement": null,
+  "channels": {
+    "1": {
+      "input_coupling": null,
+      "vertical_scale": null,
+      "vertical_position": null,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    },
+    "2": {
+      "input_coupling": null,
+      "vertical_scale": null,
+      "vertical_position": null,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    }
+  }
+}

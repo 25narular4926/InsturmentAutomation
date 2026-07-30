@@ -1,0 +1,34 @@
+{
+  "_comment": "Use-case config 1. Two-channel edge-delay: measure the delay from the CH1 falling edge to the CH2 falling edge. CH1 5 V/div (use 10 for 24 V calibrations), CH2 2 V/div. Plain numbers in the scope's native units: horizontal_scale in SECONDS (0.002 = 2 ms/div, 2.0 = 2 s/div), vertical_scale in V/div, vertical_position in divisions, trigger_position in %, record_length in points, trigger_level in volts (or \"half_battery\" = half of battery_voltage). sample_rate is derived from record_length + horizontal_scale when null.",
+  "name": "1",
+  "record_length": 10000,
+  "horizontal_scale": 2.0,
+  "trigger_position": 10,
+  "sample_rate": null,
+  "trigger_source": "CH1",
+  "trigger_type": "EDGE",
+  "trigger_slope": "FALL",
+  "trigger_level": "half_battery",
+  "trigger_mode": "NORMal",
+  "battery_voltage": 12,
+  "acquire_mode": "SAMple",
+  "measurement": "delay",
+  "channels": {
+    "1": {
+      "input_coupling": "DC",
+      "vertical_scale": 5.0,
+      "vertical_position": 0,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    },
+    "2": {
+      "input_coupling": "DC",
+      "vertical_scale": 2.0,
+      "vertical_position": -3.5,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    }
+  }
+}

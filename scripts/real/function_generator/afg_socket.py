@@ -200,6 +200,11 @@ class ChannelWaveform:
                                       # symmetry (50 = symmetric triangle, 100/0 = sawtooth).
     phase: float | None = None        # degrees
     impedance: float | None = None    # output load in ohms (50), or use "INF" for high-Z
+    # Pulse-by-levels (an alternative to amplitude/offset for a PULSe shape):
+    pulse_rate: float | None = None          # seconds (the pulse PERIOD, e.g. "2 s")
+    pulse_width: float | None = None         # seconds (high time, e.g. "950 ms")
+    pulse_high_voltage: float | None = None  # volts
+    pulse_low_voltage: float | None = None   # volts
 
 
 @dataclass
@@ -212,11 +217,34 @@ class WaveformSetup:
 CONFIGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
 
 _CHANNEL_FIELDS = ("shape", "frequency", "amplitude", "offset", "duty_cycle",
-                   "phase", "impedance")
+                   "phase", "impedance", "pulse_rate", "pulse_width",
+                   "pulse_high_voltage", "pulse_low_voltage")
+
+# How each field's value is interpreted when it carries a unit string.
+_AFG_KINDS = {"frequency": "freq", "amplitude": "voltage", "offset": "voltage",
+              "duty_cycle": "number", "phase": "number", "impedance": "ohm",
+              "pulse_rate": "time", "pulse_width": "time",
+              "pulse_high_voltage": "voltage", "pulse_low_voltage": "voltage"}
+
+
+def _parse_value(value: Any, kind: str | None):
+    """Coerce a config value to a plain number in the AFG's native units (frequency in Hz,
+    amplitude in Vpp, pulse_rate/width in seconds, voltages in V). shape stays a string."""
+    if value is None:
+        return value
+    if kind == "ohm":
+        if isinstance(value, str) and "inf" in value.lower():
+            return "INFinity"
+        return float(value)
+    return float(value)
 
 
 def _channel_from_dict(d: dict) -> ChannelWaveform:
-    return ChannelWaveform(**{k: d[k] for k in _CHANNEL_FIELDS if d.get(k) is not None})
+    out: dict[str, Any] = {}
+    for key, val in d.items():
+        if key in _CHANNEL_FIELDS and val is not None:
+            out[key] = val if key == "shape" else _parse_value(val, _AFG_KINDS.get(key))
+    return ChannelWaveform(**out)
 
 
 def _setup_from_dict(data: dict, fallback_name: str) -> WaveformSetup:
@@ -314,6 +342,15 @@ def configure(afg: SocketAFG, setup: WaveformSetup,
                 apply(f"{src}:PULSe:DCYCle", cw.duty_cycle)            # pulse/square duty
         if cw.phase is not None:
             apply(f"{src}:PHASe:ADJust", cw.phase)           # degrees
+        # Pulse by levels (PERiod before WIDTh, since width must be < period).
+        if cw.pulse_rate is not None:
+            apply(f"{src}:PULSe:PERiod", cw.pulse_rate)      # seconds (pulse period)
+        if cw.pulse_width is not None:
+            apply(f"{src}:PULSe:WIDTh", cw.pulse_width)      # seconds
+        if cw.pulse_high_voltage is not None:
+            apply(f"{src}:VOLTage:HIGH", cw.pulse_high_voltage)
+        if cw.pulse_low_voltage is not None:
+            apply(f"{src}:VOLTage:LOW", cw.pulse_low_voltage)
 
     return settings
 

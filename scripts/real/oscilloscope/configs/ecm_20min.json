@@ -1,21 +1,34 @@
 {
   "_comment": "20-minute (1200 s) single-shot capture of a slow ECM waveform. horizontal_scale 120 s/div x 10 divisions = 1200 s across the screen. A low sample rate (10 S/s) is plenty for a 1 mHz signal and keeps the record small (10 S/s x 1200 s = 12000 pts). AUTO trigger so the acquisition starts immediately (little delay). NOTE: 120 s/div exceeds the Keysight DSO-X 3034G max (50 s/div) - use the Tektronix MSO24 for this capture. CH1: 1.5 V/div DC 1 MOhm.",
   "name": "ecm_20min",
-
-  "horizontal_mode": "MANual",
-  "sample_rate": 10,
-  "horizontal_scale": 100.0,
   "record_length": 10000,
-  "horizontal_position": 10.0,
-  "acquire_mode": "SAMple",
-
-  "trigger_mode": "AUTO",
+  "horizontal_scale": 100.0,
+  "trigger_position": 10.0,
+  "sample_rate": 10.0,
   "trigger_source": "CH1",
-  "trigger_level": 2.5,
+  "trigger_type": "EDGE",
   "trigger_slope": "RISE",
-
-  "default_channel": { "scale": 1.0, "offset": 0.0, "position": -3.5, "coupling": "DC", "termination": 1e6 },
+  "trigger_level": 2.5,
+  "trigger_mode": "AUTO",
+  "battery_voltage": null,
+  "acquire_mode": "SAMple",
+  "measurement": null,
   "channels": {
-    "1": { "scale": 1.0, "offset": 0.0, "position": -3.5, "coupling": "DC", "termination": 1e6 }
+    "1": {
+      "input_coupling": "DC",
+      "vertical_scale": 1.0,
+      "vertical_position": -3.5,
+      "offset": 0.0,
+      "termination": 1000000.0,
+      "bandwidth": null
+    },
+    "2": {
+      "input_coupling": null,
+      "vertical_scale": null,
+      "vertical_position": null,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    }
   }
 }
