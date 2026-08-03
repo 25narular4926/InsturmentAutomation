@@ -134,15 +134,18 @@ def list_scope_setups() -> list[str]:
 
 
 def configure_scope(alias: str, setup: str = "bench_full", channels: str = "1,2",
-                    duration_s: float = 0.0) -> bool:
+                    duration_s: float = 0.0, horizontal_scale: float = 0.0) -> bool:
     """Apply a named scope setup to one scope and verify every setting read back.
 
-    setup      : a name from list_scope_setups(), e.g. "bench_full".
-    channels   : "1" or "1,2" - which channels to configure.
-    duration_s : >0 overrides the setup's timebase with a total capture time in seconds.
+    setup            : a name from list_scope_setups(), e.g. "bench_full".
+    channels         : "1" or "1,2" - which channels to configure.
+    horizontal_scale : >0 sets the window width directly, in SECONDS PER DIVISION (the window
+                       is horizontal_scale x 10). Overrides the setup's timebase for this call.
+    duration_s       : >0 sets the window as a TOTAL time in seconds (= horizontal_scale x 10);
+                       an alternative to horizontal_scale. horizontal_scale wins if both given.
     Returns True only if every setting read back correctly (see get_scope_config_report).
     """
-    return _fleet.configure(alias, setup, channels, float(duration_s))
+    return _fleet.configure(alias, setup, channels, float(duration_s), float(horizontal_scale))
 
 
 def get_scope_config_report(alias: str) -> str:

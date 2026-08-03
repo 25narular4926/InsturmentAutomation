@@ -348,10 +348,11 @@ def list_setups() -> list[str]:
 
 
 def configure(alias: str, setup_name: str = "bench_full", channels: str = "",
-              duration_s: float = 0.0) -> bool:
+              duration_s: float = 0.0, horizontal_scale: float = 0.0) -> bool:
     """Apply a named setup to one scope and verify every setting read back.
 
     Same behaviour as the single-scope configure(), but for the scope named `alias`.
+    horizontal_scale (seconds/div, >0) overrides the setup's timebase to set the window width.
     """
     scope = _require_scope(alias)
     setup = bs.SETUPS.get(setup_name)
@@ -360,7 +361,8 @@ def configure(alias: str, setup_name: str = "bench_full", channels: str = "",
 
     chans = _parse_channels(channels) or sorted(setup.channels) or [1]
     dur = float(duration_s) if duration_s and duration_s > 0 else None
-    applied = bs.configure(scope, setup, chans, duration=dur)
+    hs = float(horizontal_scale) if horizontal_scale and horizontal_scale > 0 else None
+    applied = bs.configure(scope, setup, chans, duration=dur, horizontal_scale=hs)
     results = bs.verify(scope, applied)
 
     _record_length[alias] = 0

@@ -459,19 +459,21 @@ def _channel_number(channel: str) -> int:
 
 def configure(scope: SocketScope, setup: ScopeSetup,
               channels: list[int] | None = None,
-              duration: float | None = None) -> list[Setting]:
+              duration: float | None = None,
+              horizontal_scale: float | None = None) -> list[Setting]:
     """Apply vertical/horizontal/trigger settings; return what was applied.
 
     Vertical settings (scale/offset/coupling) are PER-CHANNEL, so they're applied to
     every channel in `channels`. Horizontal and trigger settings are GLOBAL to the
     scope, so they're sent once regardless of how many channels are listed.
 
-    duration : total seconds across the screen. If given, it OVERRIDES the setup's
-        timebase: we hold the setup's sample rate fixed and derive both the s/div and
-        the record length from it, so the user thinks in one intuitive number
-        (seconds) instead of s/div + record length. This is the scope's own Manual-
-        mode relationship: record_length = sample_rate * duration, s/div = duration/10.
-        The named setup itself is left untouched (we override locally, not in place).
+    horizontal_scale : seconds per division. If given, it OVERRIDES the setup's timebase
+        directly (the window is horizontal_scale * 10). The record length is recomputed
+        from the setup's sample rate so Manual mode stays consistent. Use this to set the
+        capture window width per test without editing the config.
+    duration : total seconds across the screen - the same override expressed as a whole
+        window (duration = horizontal_scale * 10). horizontal_scale takes precedence if
+        both are given. The named setup itself is left untouched (we override locally).
 
     The SCPI sent depends on the scope's vendor (detected at connect from *IDN?). The
     same setup and the same returned Settings are used either way - only the commands
@@ -482,13 +484,17 @@ def configure(scope: SocketScope, setup: ScopeSetup,
     settings: list[Setting] = []
     ks = getattr(scope, "vendor", "tektronix") == "keysight"
 
-    # Effective timebase. Default to the setup's values; a duration override recomputes
-    # s/div and record length from it, keeping the setup's sample rate as the sampling
-    # resolution (more seconds -> more points, same points-per-second).
-    horizontal_scale = setup.horizontal_scale
+    # Effective timebase. Default to the setup's values; a horizontal_scale or duration
+    # override recomputes s/div and record length, keeping the setup's sample rate as the
+    # sampling resolution (more seconds -> more points, same points-per-second).
+    hscale = setup.horizontal_scale
     record_length = setup.record_length
-    if duration is not None and duration > 0:
-        horizontal_scale = duration / 10.0                 # 10 divisions across the screen
+    if horizontal_scale is not None and horizontal_scale > 0:
+        hscale = horizontal_scale                          # user-set s/div (window = hscale x 10)
+        if setup.sample_rate:
+            record_length = max(1, round(setup.sample_rate * horizontal_scale * 10))
+    elif duration is not None and duration > 0:
+        hscale = duration / 10.0                            # 10 divisions across the screen
         if setup.sample_rate:
             record_length = max(1, round(setup.sample_rate * duration))
 
@@ -532,8 +538,8 @@ def configure(scope: SocketScope, setup: ScopeSetup,
 
     # Horizontal / acquisition / trigger — global, sent once.
     if ks:
-        if horizontal_scale:
-            apply(":TIMebase:SCALe", horizontal_scale)      # value must be in the scope's range
+        if hscale:
+            apply(":TIMebase:SCALe", hscale)                # value must be in the scope's range
         # record length / memory depth is NOT settable over SCPI on InfiniiVision
         # (:ACQuire:POINts is read-only, :ACQuire:MDEPth is undefined) - memory is auto and
         # the transfer count is set at read time via :WAVeform:POINts. So nothing here.
@@ -558,8 +564,8 @@ def configure(scope: SocketScope, setup: ScopeSetup,
             apply("HORizontal:MODE", setup.horizontal_mode)
         if setup.sample_rate:
             apply("HORizontal:SAMPLERate", setup.sample_rate)
-        if horizontal_scale:
-            apply("HORizontal:SCAle", horizontal_scale)
+        if hscale:
+            apply("HORizontal:SCAle", hscale)
         if record_length:
             apply("HORizontal:RECOrdlength", record_length)
         if setup.horizontal_position is not None:
