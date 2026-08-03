@@ -348,11 +348,10 @@ def list_setups() -> list[str]:
 
 
 def configure(alias: str, setup_name: str = "bench_full", channels: str = "",
-              duration_s: float = 0.0, horizontal_scale: float = 0.0) -> bool:
+              duration_s: float = 0.0) -> bool:
     """Apply a named setup to one scope and verify every setting read back.
 
     Same behaviour as the single-scope configure(), but for the scope named `alias`.
-    horizontal_scale (seconds/div, >0) overrides the setup's timebase to set the window width.
     """
     scope = _require_scope(alias)
     setup = bs.SETUPS.get(setup_name)
@@ -361,8 +360,7 @@ def configure(alias: str, setup_name: str = "bench_full", channels: str = "",
 
     chans = _parse_channels(channels) or sorted(setup.channels) or [1]
     dur = float(duration_s) if duration_s and duration_s > 0 else None
-    hs = float(horizontal_scale) if horizontal_scale and horizontal_scale > 0 else None
-    applied = bs.configure(scope, setup, chans, duration=dur, horizontal_scale=hs)
+    applied = bs.configure(scope, setup, chans, duration=dur)
     results = bs.verify(scope, applied)
 
     _record_length[alias] = 0
@@ -452,6 +450,20 @@ def get_pulse_width(alias: str, channel: int = 1) -> float:
 def get_pulse_width_negative(alias: str, channel: int = 1) -> float:
     """Negative (low) pulse width in seconds (first pulse). 0.0 if flat / no complete pulse."""
     return bs.measure_pulse_width_negative(_require_wave(alias, int(channel)))
+
+
+def get_delay(alias: str, source1: int = 1, source2: int = 2,
+              edge1: str = "rising", edge2: str = "falling",
+              direction: str = "forward") -> float:
+    """On-scope delay between two channels, timed edge-to-edge and shown on the screen.
+
+    Programs the scope's own measurement system (no capture() needed) to time the chosen
+    edge on source1 to the chosen edge on source2. edge1/edge2 are "rising" or "falling"
+    in any combination. Returns the delay in seconds (NaN if the scope has no valid
+    measurement), and leaves the delay displayed on the instrument.
+    """
+    return bs.measure_delay(_require_scope(alias), int(source1), int(source2),
+                            str(edge1), str(edge2), str(direction))
 
 
 def get_sample_count(alias: str, channel: int = 1) -> int:

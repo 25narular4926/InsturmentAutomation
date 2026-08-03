@@ -1,0 +1,33 @@
+{
+  "_comment": "Accelerator pedal sensor supply - STP 8.3.3.3: two channels. (1) measure the supply voltage after the key-switch falling edge and before ECM power-down; (2) measure the delay from the CH1 falling edge (key switch) to the CH2 falling edge (accel pedal sensor supply). CH1 5 V/div at 0 div (use 10 V/div for 24 V ECM calibrations), CH2 2 V/div at -3.5 div, both DC. 2.0 s/div, edge trigger on CH1 FALLING at half of battery voltage, NORMal (single-shot) mode. Plain numbers in the scope's native units: vertical_scale in V/div, vertical_position in divisions, trigger_position in %, record_length in points, trigger_level \"half_battery\" = half of battery_voltage. The capture window is NOT stored in the config; set it per call with configure_scope(..., duration_s=SECONDS), which sets s/div = duration_s/10. WINDOW: pass duration_s=20 to configure_scope for this test (20 s total = 2 s/div x 10).",
+  "name": "accel_pedal_sensor",
+  "record_length": 10000,
+  "trigger_position": 10,
+  "sample_rate": null,
+  "trigger_source": "CH1",
+  "trigger_type": "EDGE",
+  "trigger_slope": "FALL",
+  "trigger_level": "half_battery",
+  "trigger_mode": "NORMal",
+  "battery_voltage": 12,
+  "acquire_mode": "SAMple",
+  "measurement": "delay",
+  "channels": {
+    "1": {
+      "input_coupling": "DC",
+      "vertical_scale": 5.0,
+      "vertical_position": 0,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    },
+    "2": {
+      "input_coupling": "DC",
+      "vertical_scale": 2.0,
+      "vertical_position": -3.5,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    }
+  }
+}

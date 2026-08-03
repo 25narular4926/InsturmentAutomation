@@ -2,7 +2,6 @@
   "_comment": "Generic fast-timebase default. Edit any value and re-run; the script loads this at startup. Keys set to null (or omitted) are left untouched on the scope.",
   "name": "default",
   "record_length": 100000,
-  "horizontal_scale": null,
   "trigger_position": 10.0,
   "sample_rate": 1250000000.0,
   "trigger_source": "CH1",

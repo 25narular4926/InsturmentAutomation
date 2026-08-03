@@ -134,18 +134,15 @@ def list_scope_setups() -> list[str]:
 
 
 def configure_scope(alias: str, setup: str = "bench_full", channels: str = "1,2",
-                    duration_s: float = 0.0, horizontal_scale: float = 0.0) -> bool:
+                    duration_s: float = 0.0) -> bool:
     """Apply a named scope setup to one scope and verify every setting read back.
 
-    setup            : a name from list_scope_setups(), e.g. "bench_full".
-    channels         : "1" or "1,2" - which channels to configure.
-    horizontal_scale : >0 sets the window width directly, in SECONDS PER DIVISION (the window
-                       is horizontal_scale x 10). Overrides the setup's timebase for this call.
-    duration_s       : >0 sets the window as a TOTAL time in seconds (= horizontal_scale x 10);
-                       an alternative to horizontal_scale. horizontal_scale wins if both given.
+    setup      : a name from list_scope_setups(), e.g. "bench_full".
+    channels   : "1" or "1,2" - which channels to configure.
+    duration_s : >0 overrides the setup's timebase with a total capture time in seconds.
     Returns True only if every setting read back correctly (see get_scope_config_report).
     """
-    return _fleet.configure(alias, setup, channels, float(duration_s), float(horizontal_scale))
+    return _fleet.configure(alias, setup, channels, float(duration_s))
 
 
 def get_scope_config_report(alias: str) -> str:
@@ -199,6 +196,20 @@ def scope_pulse_width(alias: str, channel: int = 1) -> float:
 def scope_pulse_width_negative(alias: str, channel: int = 1) -> float:
     """Negative (low) pulse width in seconds (first pulse); 0.0 if flat / no complete pulse."""
     return _fleet.get_pulse_width_negative(alias, int(channel))
+
+
+def scope_delay(alias: str, source1: int = 1, source2: int = 2,
+                edge1: str = "rising", edge2: str = "falling",
+                direction: str = "forward") -> float:
+    """Delay between two channels, measured by the scope and shown on its screen.
+
+    Times the chosen edge on source1 to the chosen edge on source2 (edge1/edge2 are
+    "rising" or "falling", any combination, e.g. falling->falling). No capture() needed -
+    the scope measures the live signal, posts a delay badge on its display, and returns
+    the value in seconds (NaN if the scope has no valid measurement).
+    """
+    return _fleet.get_delay(alias, int(source1), int(source2),
+                            str(edge1), str(edge2), str(direction))
 
 
 def scope_sample_count(alias: str, channel: int = 1) -> int:

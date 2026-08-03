@@ -1,0 +1,32 @@
+{
+  "_comment": "AAT signal-generator sweep, GENERATOR side - STP 8.6.2.3: drive a triangle onto the ambient air temperature sensor signal. RAMP shape, duty_cycle 50 = symmetric triangle. High 4.9 V, low 0.1 V -> amplitude 4.8 Vpp on a 2.5 V offset (0.1..4.9 V). High-Z output for the ECM input. NOTE: STP 8.6.2.3.4 says 'Frequency = 1 MHz', but that is inconsistent with the paired 100 s/div scope window (aat_triangle_scope) and the smooth 0.1..4.9 V sweep verified in 8.6.4.3, so it is set here to 0.001 Hz (1 mHz, period 1000 s) - the same slow-sweep convention as triangle_1mhz. TODO(confirm): set frequency to the true STP value if the ECM really needs 1 MHz. Output stays OFF until output_on. Plain numbers in native units: frequency in Hz, amplitude in Vpp, voltages in V, impedance in ohms (or \"INFinity\").",
+  "name": "aat_triangle_gen",
+  "default_channel": {
+    "shape": "RAMP",
+    "frequency": 0.001,
+    "amplitude": 4.8,
+    "offset": 2.5,
+    "duty_cycle": 50.0,
+    "phase": null,
+    "impedance": "INFinity",
+    "pulse_rate": null,
+    "pulse_width": null,
+    "pulse_high_voltage": null,
+    "pulse_low_voltage": null
+  },
+  "channels": {
+    "1": {
+      "shape": "RAMP",
+      "frequency": 0.001,
+      "amplitude": 4.8,
+      "offset": 2.5,
+      "duty_cycle": 50.0,
+      "phase": null,
+      "impedance": "INFinity",
+      "pulse_rate": null,
+      "pulse_width": null,
+      "pulse_high_voltage": null,
+      "pulse_low_voltage": null
+    }
+  }
+}

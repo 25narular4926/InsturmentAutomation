@@ -1,8 +1,7 @@
 {
-  "_comment": "Matches the bench screenshot: CH1+CH2 at 5 V/div, 4 s/div, 250 S/s, 10 kpts, trigger on CH1 @ 6.8 V. Self-consistent: 250 S/s * 4 s/div * 10 div = 10,000 pts.",
+  "_comment": "Matches the bench screenshot: CH1+CH2 at 5 V/div, 4 s/div, 250 S/s, 10 kpts, trigger on CH1 @ 6.8 V. Self-consistent: 250 S/s * 4 s/div * 10 div = 10,000 pts. WINDOW: pass duration_s=40 to configure_scope for this test (40 s total = 4 s/div x 10).",
   "name": "bench",
   "record_length": 10000,
-  "horizontal_scale": 4.0,
   "trigger_position": 10.0,
   "sample_rate": 250.0,
   "trigger_source": "CH1",

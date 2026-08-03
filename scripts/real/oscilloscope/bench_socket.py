@@ -459,21 +459,19 @@ def _channel_number(channel: str) -> int:
 
 def configure(scope: SocketScope, setup: ScopeSetup,
               channels: list[int] | None = None,
-              duration: float | None = None,
-              horizontal_scale: float | None = None) -> list[Setting]:
+              duration: float | None = None) -> list[Setting]:
     """Apply vertical/horizontal/trigger settings; return what was applied.
 
     Vertical settings (scale/offset/coupling) are PER-CHANNEL, so they're applied to
     every channel in `channels`. Horizontal and trigger settings are GLOBAL to the
     scope, so they're sent once regardless of how many channels are listed.
 
-    horizontal_scale : seconds per division. If given, it OVERRIDES the setup's timebase
-        directly (the window is horizontal_scale * 10). The record length is recomputed
-        from the setup's sample rate so Manual mode stays consistent. Use this to set the
-        capture window width per test without editing the config.
-    duration : total seconds across the screen - the same override expressed as a whole
-        window (duration = horizontal_scale * 10). horizontal_scale takes precedence if
-        both are given. The named setup itself is left untouched (we override locally).
+    duration : total seconds across the screen. If given, it OVERRIDES the setup's
+        timebase: we hold the setup's sample rate fixed and derive both the s/div and
+        the record length from it, so the user thinks in one intuitive number
+        (seconds) instead of s/div + record length. This is the scope's own Manual-
+        mode relationship: record_length = sample_rate * duration, s/div = duration/10.
+        The named setup itself is left untouched (we override locally, not in place).
 
     The SCPI sent depends on the scope's vendor (detected at connect from *IDN?). The
     same setup and the same returned Settings are used either way - only the commands
@@ -484,17 +482,13 @@ def configure(scope: SocketScope, setup: ScopeSetup,
     settings: list[Setting] = []
     ks = getattr(scope, "vendor", "tektronix") == "keysight"
 
-    # Effective timebase. Default to the setup's values; a horizontal_scale or duration
-    # override recomputes s/div and record length, keeping the setup's sample rate as the
-    # sampling resolution (more seconds -> more points, same points-per-second).
-    hscale = setup.horizontal_scale
+    # Effective timebase. Default to the setup's values; a duration override recomputes
+    # s/div and record length from it, keeping the setup's sample rate as the sampling
+    # resolution (more seconds -> more points, same points-per-second).
+    horizontal_scale = setup.horizontal_scale
     record_length = setup.record_length
-    if horizontal_scale is not None and horizontal_scale > 0:
-        hscale = horizontal_scale                          # user-set s/div (window = hscale x 10)
-        if setup.sample_rate:
-            record_length = max(1, round(setup.sample_rate * horizontal_scale * 10))
-    elif duration is not None and duration > 0:
-        hscale = duration / 10.0                            # 10 divisions across the screen
+    if duration is not None and duration > 0:
+        horizontal_scale = duration / 10.0                 # 10 divisions across the screen
         if setup.sample_rate:
             record_length = max(1, round(setup.sample_rate * duration))
 
@@ -538,8 +532,8 @@ def configure(scope: SocketScope, setup: ScopeSetup,
 
     # Horizontal / acquisition / trigger — global, sent once.
     if ks:
-        if hscale:
-            apply(":TIMebase:SCALe", hscale)                # value must be in the scope's range
+        if horizontal_scale:
+            apply(":TIMebase:SCALe", horizontal_scale)      # value must be in the scope's range
         # record length / memory depth is NOT settable over SCPI on InfiniiVision
         # (:ACQuire:POINts is read-only, :ACQuire:MDEPth is undefined) - memory is auto and
         # the transfer count is set at read time via :WAVeform:POINts. So nothing here.
@@ -564,8 +558,8 @@ def configure(scope: SocketScope, setup: ScopeSetup,
             apply("HORizontal:MODE", setup.horizontal_mode)
         if setup.sample_rate:
             apply("HORizontal:SAMPLERate", setup.sample_rate)
-        if hscale:
-            apply("HORizontal:SCAle", hscale)
+        if horizontal_scale:
+            apply("HORizontal:SCAle", horizontal_scale)
         if record_length:
             apply("HORizontal:RECOrdlength", record_length)
         if setup.horizontal_position is not None:
@@ -965,6 +959,85 @@ def measure_pulse_width_negative(wf: Waveform) -> float:
             if fall_t is not None:
                 return float(_cross_time(t, v, i, mid) - fall_t)
     return 0.0                                # no complete negative pulse in the record
+
+
+# --- on-scope measurement (delay between two channels) ---------------------
+# Unlike the feature measurements above, this one is computed by the INSTRUMENT and
+# shown on its own screen. It sends measurement SCPI, so it takes a live SocketScope
+# (not a Waveform) and needs no prior capture().
+
+def _norm_edge(edge: str) -> str:
+    """Normalize an edge word to 'RISE' or 'FALL'. Anything falling-ish -> 'FALL'."""
+    e = str(edge).strip().upper()
+    if e in ("FALL", "FALLING", "FALLINGEDGE", "NEG", "NEGATIVE", "-", "DOWN"):
+        return "FALL"
+    return "RISE"
+
+
+def _meas_float(reply: str) -> float:
+    """Parse an on-scope measurement reply to a float; NaN if absent or the instrument's
+    'no valid measurement' sentinel (~9.9E37)."""
+    try:
+        val = float(reply)
+    except (TypeError, ValueError):
+        return float("nan")
+    if abs(val) >= 9.9e37:
+        return float("nan")
+    return val
+
+
+def measure_delay(scope: SocketScope, source1: Any, source2: Any,
+                  edge1: str = "rising", edge2: str = "falling",
+                  direction: str = "forward") -> float:
+    """Measure the delay between two channels and DISPLAY it on the scope's screen.
+
+    This is an ON-SCOPE measurement: the instrument times the chosen edge on source1 to
+    the chosen edge on source2, posts a delay badge on its own display, and returns the
+    value. It does NOT use a captured Waveform - it programs the scope's measurement
+    system directly, so it works on the live signal (no capture() needed first).
+
+    source1, source2 : the FROM and TO channels - a number (1) or a name ("CH2"/"2").
+    edge1, edge2     : which edge to time on each source, "rising" or "falling". Any
+                       combination works (rising->falling, falling->falling, ...).
+    direction        : "forward" (time to the NEXT source2 edge, default) or "backward".
+
+    Returns the delay in seconds (positive = the source2 edge comes AFTER the source1
+    edge). The badge stays on the scope screen until the measurement is cleared. On
+    Tektronix this replaces the on-screen measurement table (it clears it first) so the
+    slot is predictable; on Keysight the delay is added to the measurement readout.
+    """
+    n1 = _channel_number(str(source1))
+    n2 = _channel_number(str(source2))
+    e1 = _norm_edge(edge1)
+    e2 = _norm_edge(edge2)
+    ks = getattr(scope, "vendor", "tektronix") == "keysight"
+
+    if ks:
+        # InfiniiVision: define the slope+occurrence for each source, then measure the
+        # delay between the two channels (the query both measures and posts it on screen).
+        s1 = "+" if e1 == "RISE" else "-"
+        s2 = "+" if e2 == "RISE" else "-"
+        scope.write(f":MEASure:DEFine DELay,{s1}1,{s2}1")   # slope,occurrence per source
+        reply = scope.query(f":MEASure:DELay? CHANnel{n1},CHANnel{n2}")
+    else:
+        # TekScope (MSO 2/4-series): add a DELAY measurement badge, aim it at the two
+        # channels and edges, and read its current value.
+        te1 = "RISe" if e1 == "RISE" else "FALL"
+        te2 = "RISe" if e2 == "RISE" else "FALL"
+        tdir = "FORWard" if str(direction).strip().lower().startswith("f") else "BACKward"
+        scope.write("MEASUrement:DELETEALL")                 # clear the table -> MEAS1 is ours
+        scope.write('MEASUrement:ADDNew "MEAS1"')
+        scope.write("MEASUrement:MEAS1:TYPe DELay")
+        scope.write(f"MEASUrement:MEAS1:SOUrce1 CH{n1}")
+        scope.write(f"MEASUrement:MEAS1:SOUrce2 CH{n2}")
+        scope.write(f"MEASUrement:MEAS1:DELay:EDGE1 {te1}")
+        scope.write(f"MEASUrement:MEAS1:DELay:EDGE2 {te2}")
+        scope.write(f"MEASUrement:MEAS1:DELay:DIRection {tdir}")
+        # TODO(confirm): value query + edge/direction subcommands vary by firmware -
+        # verify MEASUrement:MEAS1:RESUlts:CURRentacq:MEAN? against the live MSO.
+        reply = scope.query("MEASUrement:MEAS1:RESUlts:CURRentacq:MEAN?")
+
+    return _meas_float(reply)
 
 
 # --- CSV formatting -------------------------------------------------------

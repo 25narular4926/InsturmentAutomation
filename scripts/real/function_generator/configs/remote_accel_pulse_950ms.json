@@ -1,0 +1,32 @@
+{
+  "_comment": "Remote accelerator - Out of Range Time Verification, IN-RANGE pulse - STP 8.5.3.2: drive J2-68 (remote accelerator sensor input). Pulse: period 2.0 s, width 0.95 s (950 ms, within the valid window), high 5.0 V, low 0.75 V, high-Z. Pair with a scope capture of pulse rate/width/high/low. Output stays OFF until output_on. Plain numbers in native units: pulse_rate/pulse_width in SECONDS, voltages in V, impedance in ohms (or \"INFinity\").",
+  "name": "remote_accel_pulse_950ms",
+  "default_channel": {
+    "shape": "PULSe",
+    "frequency": null,
+    "amplitude": null,
+    "offset": null,
+    "duty_cycle": null,
+    "phase": null,
+    "impedance": "INFinity",
+    "pulse_rate": 2.0,
+    "pulse_width": 0.95,
+    "pulse_high_voltage": 5.0,
+    "pulse_low_voltage": 0.75
+  },
+  "channels": {
+    "1": {
+      "shape": "PULSe",
+      "frequency": null,
+      "amplitude": null,
+      "offset": null,
+      "duty_cycle": null,
+      "phase": null,
+      "impedance": "INFinity",
+      "pulse_rate": 2.0,
+      "pulse_width": 0.95,
+      "pulse_high_voltage": 5.0,
+      "pulse_low_voltage": 0.75
+    }
+  }
+}

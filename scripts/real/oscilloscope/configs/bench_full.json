@@ -1,8 +1,7 @@
 {
-  "_comment": "Every setting readable from the scope's front-panel badges, transcribed exactly. Ch1/Ch2: 5 V/div, 1 MOhm, 500 MHz. Horizontal: 4 s/div (40 s total), 250 S/s, 10 kpts, position 10%. Trigger: CH1, 6.8 V. Acquisition: Manual, Sample.",
+  "_comment": "Every setting readable from the scope's front-panel badges, transcribed exactly. Ch1/Ch2: 5 V/div, 1 MOhm, 500 MHz. Horizontal: 4 s/div (40 s total), 250 S/s, 10 kpts, position 10%. Trigger: CH1, 6.8 V. Acquisition: Manual, Sample. WINDOW: pass duration_s=40 to configure_scope for this test (40 s total = 4 s/div x 10).",
   "name": "bench_full",
   "record_length": 10000,
-  "horizontal_scale": 4.0,
   "trigger_position": 10.0,
   "sample_rate": 250.0,
   "trigger_source": "CH1",

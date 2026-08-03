@@ -1,0 +1,32 @@
+{
+  "_comment": "Remote accelerator - Out of Range Time Verification, OUT-OF-RANGE pulse - STP 8.5.5.1: drive J2-68 (remote accelerator sensor input). Pulse: period 2.0 s, width 1.05 s (1050 ms, exceeds the valid window to trigger the out-of-range fault), high 5.0 V, low 0.75 V, high-Z. STP runs this as a MANUAL single pulse - configure it, then drive one pulse (output_on / output_off) and capture. Output stays OFF until output_on. Plain numbers in native units: pulse_rate/pulse_width in SECONDS, voltages in V, impedance in ohms (or \"INFinity\").",
+  "name": "remote_accel_pulse_1050ms",
+  "default_channel": {
+    "shape": "PULSe",
+    "frequency": null,
+    "amplitude": null,
+    "offset": null,
+    "duty_cycle": null,
+    "phase": null,
+    "impedance": "INFinity",
+    "pulse_rate": 2.0,
+    "pulse_width": 1.05,
+    "pulse_high_voltage": 5.0,
+    "pulse_low_voltage": 0.75
+  },
+  "channels": {
+    "1": {
+      "shape": "PULSe",
+      "frequency": null,
+      "amplitude": null,
+      "offset": null,
+      "duty_cycle": null,
+      "phase": null,
+      "impedance": "INFinity",
+      "pulse_rate": 2.0,
+      "pulse_width": 1.05,
+      "pulse_high_voltage": 5.0,
+      "pulse_low_voltage": 0.75
+    }
+  }
+}

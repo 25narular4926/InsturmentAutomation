@@ -1,8 +1,7 @@
 {
-  "_comment": "Use-case config 1. Two-channel edge-delay: measure the delay from the CH1 falling edge to the CH2 falling edge. CH1 5 V/div (use 10 for 24 V calibrations), CH2 2 V/div. Plain numbers in the scope's native units: horizontal_scale in SECONDS (0.002 = 2 ms/div, 2.0 = 2 s/div), vertical_scale in V/div, vertical_position in divisions, trigger_position in %, record_length in points, trigger_level in volts (or \"half_battery\" = half of battery_voltage). sample_rate is derived from record_length + horizontal_scale when null.",
+  "_comment": "Use-case config 1. Two-channel edge-delay: measure the delay from the CH1 falling edge to the CH2 falling edge. CH1 5 V/div (use 10 for 24 V calibrations), CH2 2 V/div. Plain numbers in the scope's native units: vertical_scale in V/div, vertical_position in divisions, trigger_position in %, record_length in points, trigger_level in volts (or \"half_battery\" = half of battery_voltage). The capture window is NOT stored in the config; set it per call with configure_scope(..., duration_s=SECONDS), which sets s/div = duration_s/10. WINDOW: pass duration_s=20 to configure_scope for this test (20 s total = 2 s/div x 10).",
   "name": "1",
   "record_length": 10000,
-  "horizontal_scale": 2.0,
   "trigger_position": 10,
   "sample_rate": null,
   "trigger_source": "CH1",

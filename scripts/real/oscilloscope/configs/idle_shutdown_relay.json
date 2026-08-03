@@ -1,0 +1,33 @@
+{
+  "_comment": "Idle Shutdown Relay ECM output - STP 8.5.7.2: RMS voltage on CH1, referenced to battery ground. Single channel, 2 V/div (use 5 for 24 V ECM calibrations), vertical position -3.5 div, 2 ms/div, edge trigger on CH1 rising at half of battery voltage, NORMal (single-shot) mode. Plain numbers in the scope's native units: vertical_scale in V/div, vertical_position in divisions, trigger_position in %, record_length in points, trigger_level \"half_battery\" = half of battery_voltage. The capture window is NOT stored in the config; set it per call with configure_scope(..., duration_s=SECONDS), which sets s/div = duration_s/10. WINDOW: pass duration_s=0.02 to configure_scope for this test (0.02 s total = 0.002 s/div x 10).",
+  "name": "idle_shutdown_relay",
+  "record_length": 10000,
+  "trigger_position": 10,
+  "sample_rate": null,
+  "trigger_source": "CH1",
+  "trigger_type": "EDGE",
+  "trigger_slope": "RISE",
+  "trigger_level": "half_battery",
+  "trigger_mode": "NORMal",
+  "battery_voltage": 12,
+  "acquire_mode": "SAMple",
+  "measurement": "rms",
+  "channels": {
+    "1": {
+      "input_coupling": "DC",
+      "vertical_scale": 2.0,
+      "vertical_position": -3.5,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    },
+    "2": {
+      "input_coupling": null,
+      "vertical_scale": null,
+      "vertical_position": null,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    }
+  }
+}

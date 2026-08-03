@@ -1,8 +1,7 @@
 {
-  "_comment": "Use-case config 2. RMS voltage on CH1, normal trigger. CH1 2 V/div (use 5 for 24 V calibrations). Plain numbers in the scope's native units: horizontal_scale in SECONDS (0.002 = 2 ms/div, 2.0 = 2 s/div), vertical_scale in V/div, vertical_position in divisions, trigger_position in %, record_length in points, trigger_level in volts (or \"half_battery\" = half of battery_voltage). sample_rate is derived from record_length + horizontal_scale when null.",
+  "_comment": "Use-case config 2. RMS voltage on CH1, normal trigger. CH1 2 V/div (use 5 for 24 V calibrations). Plain numbers in the scope's native units: vertical_scale in V/div, vertical_position in divisions, trigger_position in %, record_length in points, trigger_level in volts (or \"half_battery\" = half of battery_voltage). The capture window is NOT stored in the config; set it per call with configure_scope(..., duration_s=SECONDS), which sets s/div = duration_s/10. WINDOW: pass duration_s=0.02 to configure_scope for this test (0.02 s total = 0.002 s/div x 10).",
   "name": "2",
   "record_length": 10000,
-  "horizontal_scale": 0.002,
   "trigger_position": 10,
   "sample_rate": null,
   "trigger_source": "CH1",

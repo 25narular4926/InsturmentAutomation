@@ -1,8 +1,7 @@
 {
-  "_comment": "20-minute (1200 s) single-shot capture of a slow ECM waveform. horizontal_scale 120 s/div x 10 divisions = 1200 s across the screen. A low sample rate (10 S/s) is plenty for a 1 mHz signal and keeps the record small (10 S/s x 1200 s = 12000 pts). AUTO trigger so the acquisition starts immediately (little delay). NOTE: 120 s/div exceeds the Keysight DSO-X 3034G max (50 s/div) - use the Tektronix MSO24 for this capture. CH1: 1.5 V/div DC 1 MOhm.",
+  "_comment": "20-minute (1200 s) single-shot capture of a slow ECM waveform. sample_rate is pinned at 10 S/s (plenty for a 1 mHz signal, keeps the record small). AUTO trigger so the acquisition starts immediately (little delay). NOTE: this needs a 120 s/div window, which exceeds the Keysight DSO-X 3034G max (50 s/div) - use the Tektronix MSO24 for this capture. CH1: 1 V/div DC 1 MOhm. The capture window is NOT stored in the config; set it per call with configure_scope(..., duration_s=SECONDS), which sets s/div = duration_s/10. WINDOW: pass duration_s=1200 to configure_scope for this test (1200 s total = 120 s/div x 10; with the pinned 10 S/s that is 12000 points).",
   "name": "ecm_20min",
   "record_length": 10000,
-  "horizontal_scale": 100.0,
   "trigger_position": 10.0,
   "sample_rate": 10.0,
   "trigger_source": "CH1",

@@ -1,0 +1,33 @@
+{
+  "_comment": "AAT signal-generator sweep, SCOPE side - STP 8.6.3.2: capture the triangle sweep driven onto the ambient air temperature sensor signal (pair with the aat_triangle_gen function-generator config). Single channel, 1 V/div, vertical position -3.5 div, 100 s/div (a very wide, slow window - 1000 s across screen), edge trigger on CH1 rising at 2.5 V, AUTO (free-run) mode, RMS. NOTE: the wide 100 s/div window fits a SLOW sweep (see aat_triangle_gen - the STP's '1 MHz' is interpreted as 1 mHz to match this window and the smooth 0.1..4.9 V sweep verified in 8.6.4.3); confirm against the live STP. Plain numbers in the scope's native units: vertical_scale in V/div, vertical_position in divisions, trigger_position in %, record_length in points, trigger_level in volts. The capture window is NOT stored in the config; set it per call with configure_scope(..., duration_s=SECONDS), which sets s/div = duration_s/10. WINDOW: pass duration_s=1000 to configure_scope for this test (1000 s total = 100 s/div x 10).",
+  "name": "aat_triangle_scope",
+  "record_length": 10000,
+  "trigger_position": 10,
+  "sample_rate": null,
+  "trigger_source": "CH1",
+  "trigger_type": "EDGE",
+  "trigger_slope": "RISE",
+  "trigger_level": 2.5,
+  "trigger_mode": "AUTO",
+  "battery_voltage": null,
+  "acquire_mode": "SAMple",
+  "measurement": "rms",
+  "channels": {
+    "1": {
+      "input_coupling": "DC",
+      "vertical_scale": 1.0,
+      "vertical_position": -3.5,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    },
+    "2": {
+      "input_coupling": null,
+      "vertical_scale": null,
+      "vertical_position": null,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    }
+  }
+}
