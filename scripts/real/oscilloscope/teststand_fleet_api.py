@@ -59,6 +59,7 @@ _waves: dict[str, dict[int, bs.Waveform]] = {}
 _reports: dict[str, str] = {}
 _afg_reports: dict[str, str] = {}
 _record_length: dict[str, int] = {}
+_armed: dict[str, list[int]] = {}       # channels armed by arm(), read back by read_armed()
 _last_found: list[dict] = []       # cache of the last scan, so connect_matching can reuse it
 
 
@@ -411,6 +412,39 @@ def capture(alias: str, channels: str = "1", points: int = 0, single: bool = Fal
         _waves[alias] = bs.acquire_many(scope, chans, n_points)
     else:
         _waves[alias] = bs.capture_live(scope, chans, n_points)
+    return len(_waves[alias]) == len(chans)
+
+
+def arm(alias: str, channels: str = "1") -> bool:
+    """Arm ONE acquisition and return immediately (non-blocking). Tektronix.
+
+    For an event that happens in a LATER step: the scope waits for its configured trigger on
+    its own, captures one record and freezes it. Call read_armed() after the event to pull it.
+    The config MUST use trigger_mode NORMal - AUTO would self-trigger before your event.
+    """
+    scope = _require_scope(alias)
+    chans = _parse_channels(channels) or [1]
+    _armed[alias] = chans
+    bs.arm_acquisition(scope)
+    return True
+
+
+def read_armed(alias: str, points: int = 0, timeout_s: float = 120.0) -> bool:
+    """Read the record from a prior arm() once the trigger has fired. Tektronix.
+
+    Waits up to timeout_s for the armed acquisition to COMPLETE (the trigger fired and the
+    record filled), then reads every armed channel off the frozen record - it does NOT re-arm
+    or force AUTO, so the captured event is preserved. Raises TimeoutError if the acquisition
+    never completes (the trigger never fired).
+    """
+    scope = _require_scope(alias)
+    chans = _armed.get(alias) or [1]
+    n_points = int(points) if int(points) > 0 else (_record_length.get(alias, 0) or 1000)
+    if not bs.wait_until_stopped(scope, float(timeout_s)):
+        raise TimeoutError(
+            f"[{alias}] armed acquisition did not complete within {timeout_s:g} s - did the "
+            f"trigger fire? (the config must be NORMal and the event must occur after arm())")
+    _waves[alias] = bs.acquire_many(scope, chans, n_points)
     return len(_waves[alias]) == len(chans)
 
 
