@@ -1,0 +1,1819 @@
+#!/usr/bin/env python3
+
+# No-VISA fallback: talk to the MSO44B over its raw Socket Server, for benches where
+# tm_devices/VISA can't connect (e.g. link-local LAN where only the scope's Socket
+# Server is reachable). Pure Python stdlib — no VISA, no tm_devices, no pyvisa.
+#
+# The scope's Socket Server must be ON. On this scope, Utility -> I/O -> Socket Server:
+#   Enabled via Protocol = Terminal (Protocol "None" leaves the port closed), Port 4000.
+# Terminal mode echoes commands / adds a prompt, so replies are cleaned below.
+#
+# Capabilities (the same shape as bench_scope.py + bench_configure.py, but over the
+# socket instead of tm_devices):
+#   --identify   *IDN?  ->  the scope's identity
+#   --configure  apply a ScopeSetup (vertical/horizontal/trigger/transfer) then read
+#                every setting back and print a PASS/FAIL table
+#   --capture    pull a waveform as ASCII (comma-separated codes), scale it, summarise
+#   --query      send any text SCPI query
+# Capture uses ASCII encoding (not binary) so the curve round-trips through the
+# Terminal-mode socket — the same approach the ../sim scripts use.
+#
+#   python bench_socket.py --host 169.254.8.134 --identify
+#   python bench_socket.py --host 169.254.8.134 --configure
+#   python bench_socket.py --host 169.254.8.134 --capture --channel 1
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import socket
+import struct
+import sys
+import time
+import zlib
+from dataclasses import dataclass, field
+from typing import Any
+
+
+def detect_vendor(idn: str) -> str:
+    """Map an *IDN? string to a vendor key: 'tektronix' or 'keysight'.
+
+    *IDN? starts with the manufacturer, e.g. 'TEKTRONIX,MSO44,...' or
+    'KEYSIGHT TECHNOLOGIES,DSOX1204A,...' (older Keysight scopes say 'AGILENT'). Anything
+    unrecognized defaults to 'tektronix' so existing benches keep working.
+    """
+    up = idn.upper()
+    if "KEYSIGHT" in up or "AGILENT" in up:
+        return "keysight"
+    return "tektronix"
+
+
+# --- Keysight value translations (the named setups use Tektronix terms) ---------------
+_KS_COUPLING = {"DC": "DC", "AC": "AC", "DCREJ": "DC"}          # Keysight has no DCREJ
+_KS_ACQ_TYPE = {"SAMPLE": "NORMal", "HIRES": "HRESolution",
+                "PEAKDETECT": "PEAK", "AVERAGE": "AVERage", "ENVELOPE": "PEAK"}
+_KS_SLOPE = {"RISE": "POSitive", "FALL": "NEGative"}
+
+
+def _ks_impedance(ohms: float) -> str:
+    """Tek termination (1e6 / 50 ohms) -> Keysight impedance keyword."""
+    return "FIFTy" if abs(float(ohms) - 50) < 1 else "ONEMeg"
+
+
+class SocketScope:
+    """Minimal raw-socket SCPI client. Detects the vendor (Tektronix / Keysight) from
+    *IDN? at connect, so configure()/acquire() can send the right SCPI for that brand.
+
+    A raw SCPI socket (port 5025) is dropped by the instrument when it sits idle - which is
+    exactly what happens between TestStand steps (configure ... then later capture). So every
+    query/write transparently reconnects and retries once if the socket has been closed
+    underneath us. The detected vendor is remembered across a reconnect (no re-detect)."""
+
+    def __init__(self, host: str, port: int = 5025, timeout: float = 5.0) -> None:
+        self.host = host
+        self.port = int(port)
+        self.timeout = timeout
+        self.sock: socket.socket | None = None
+        self.vendor = "tektronix"      # provisional until the first connect detects it
+        self.idn = ""
+        self._last_io = 0.0
+        self._open(first=True)
+
+    # Per-read timeout used to detect "reply done" (a short silence ends a reply). Kept small
+    # because on a raw 5025 socket replies arrive in one burst; a bigger value just wastes a
+    # full timeout on every single query/write. Big transfers (CURVe?) stream continuously, so
+    # the end-of-reply gap is still detected correctly.
+    READ_TIMEOUT = 0.4
+    DRAIN_TIMEOUT = 0.12           # even shorter: after a write there is only fast echo (or none)
+    # If the socket has been idle longer than this, reconnect BEFORE sending. The instrument
+    # silently drops idle raw-socket connections, and a send on a half-open socket can succeed
+    # (data lost) without raising - so we can't rely on catching the error afterward. Proactive
+    # reconnect on idle avoids that race entirely (between TestStand steps, or while another
+    # instrument is being configured).
+    IDLE_RECONNECT = 5.0
+
+    def _open(self, first: bool = False) -> None:
+        """Open the socket and re-establish session state (vendor detect on first open only,
+        then headers off). Uses low-level _tell/_ask so it can't recurse into a reconnect."""
+        self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        self.sock.settimeout(self.READ_TIMEOUT)
+        self._drain()                  # discard any connect-time banner / prompt
+
+        if first:
+            # Read the identity FIRST (works with headers on or off) and pick the vendor.
+            self.idn = self._ask("*IDN?").strip()
+            self.vendor = detect_vendor(self.idn)
+
+        # Bare query responses. With headers ON a scope prefixes replies with the command
+        # path (":WFMOUTPRE:XZERO -2.0E-3"), which float() can't parse - the classic
+        # "could not convert string to float". Turn headers off with the vendor's command.
+        if self.vendor == "keysight":
+            self._tell(":SYSTem:HEADer OFF")
+        else:                          # tektronix (and unknown -> assume Tek-style)
+            self._tell("HEADer OFF")
+            self._tell("VERBose OFF")
+        self._last_io = time.monotonic()
+
+    def _reconnect(self) -> None:
+        """Re-open the socket after the instrument dropped an idle connection."""
+        try:
+            if self.sock is not None:
+                self.sock.close()
+        except OSError:
+            pass
+        self._open(first=False)         # keep the vendor already detected
+
+    def _ensure_fresh(self) -> None:
+        """Reconnect proactively if the socket has been idle long enough that the instrument
+        may have dropped it - so we never send on a half-open connection."""
+        if time.monotonic() - self._last_io > self.IDLE_RECONNECT:
+            self._reconnect()
+
+    def _drain(self) -> None:
+        """Read and throw away whatever is already waiting (banner, stale prompt/echo).
+        Uses a very short timeout - there is only a fast Terminal-mode echo, or nothing."""
+        self.sock.settimeout(self.DRAIN_TIMEOUT)
+        try:
+            while self.sock.recv(4096):
+                pass
+        except socket.timeout:
+            pass
+        finally:
+            self.sock.settimeout(self.READ_TIMEOUT)
+
+    def _read(self) -> str:
+        """Read until the scope goes quiet (a short read-timeout marks the end)."""
+        chunks: list[bytes] = []
+        try:
+            while True:
+                data = self.sock.recv(4096)
+                if not data:
+                    break
+                chunks.append(data)
+        except socket.timeout:
+            pass
+        return b"".join(chunks).decode(errors="replace")
+
+    # --- Low-level send helpers used DURING connect (never reconnect - would recurse) -----
+    def _tell(self, cmd: str) -> None:
+        self.sock.sendall(cmd.encode() + b"\n")
+        time.sleep(0.1)
+        self._drain()
+
+    def _ask(self, cmd: str) -> str:
+        self.sock.sendall(cmd.encode() + b"\n")
+        time.sleep(0.2)
+        return _clean(self._read(), cmd)
+
+    # --- Public API - proactive idle reconnect + reactive retry once on a dropped socket ---
+    def query(self, cmd: str, *, debug: bool = False) -> str:
+        self._ensure_fresh()
+        try:
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.2)
+            raw = self._read()
+        except OSError:                # idle connection dropped - reconnect and retry once
+            self._reconnect()
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.2)
+            raw = self._read()
+        self._last_io = time.monotonic()
+        if debug:
+            print(f"  raw reply: {raw!r}", file=sys.stderr)
+        return _clean(raw, cmd)
+
+    def query_raw(self, cmd: str) -> str:
+        """Return the FULL reply, uncleaned — for big replies (a curve) that may
+        arrive wrapped across many lines in Terminal mode."""
+        self._ensure_fresh()
+        try:
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.2)
+            raw = self._read()
+        except OSError:                # idle connection dropped - reconnect and retry once
+            self._reconnect()
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.2)
+            raw = self._read()
+        self._last_io = time.monotonic()
+        return raw
+
+    def write(self, cmd: str) -> None:
+        self._ensure_fresh()
+        try:
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.1)
+            self._drain()
+        except OSError:                # idle connection dropped - reconnect and retry once
+            self._reconnect()
+            self.sock.sendall(cmd.encode() + b"\n")
+            time.sleep(0.1)
+            self._drain()
+        self._last_io = time.monotonic()
+
+    def close(self) -> None:
+        if self.sock is not None:
+            self.sock.close()
+
+
+def _clean(raw: str, cmd: str) -> str:
+    """Strip Terminal-mode echo and prompt noise; return the meaningful reply line.
+
+    Terminal mode may echo the command back and wrap the answer in prompt characters
+    (e.g. a trailing '>'). We split into lines, drop the echoed command and empty/prompt
+    lines, and return the last real line — which for a query is the response.
+    """
+    lines = [ln.strip(" \t\r\n>") for ln in raw.replace("\r", "\n").split("\n")]
+    lines = [ln for ln in lines if ln and ln != cmd.strip()]
+    return lines[-1] if lines else ""
+
+
+# ---------------------------------------------------------------------------
+# Configure — the same job as bench_configure.py, over the socket. Sends the
+# standard Tek SCPI writes, then reads every setting back and checks it landed.
+# ---------------------------------------------------------------------------
+@dataclass
+class ChannelSetup:
+    """Vertical settings — these are PER CHANNEL, so each channel can differ."""
+    scale: float | None = None        # volts/div
+    offset: float | None = None       # volts
+    position: float | None = None     # vertical position in DIVISIONS (Tek CH:POSition;
+                                      # +up, -down). Distinct from offset (volts).
+    coupling: str | None = None       # DC | AC | DCREJ
+    termination: float | None = None  # input impedance in ohms: 1e6 (1 MOhm) or 50
+    bandwidth: float | None = None    # input bandwidth limit in Hz, e.g. 500e6
+
+
+@dataclass
+class ScopeSetup:
+    """A named bench setup: per-channel vertical + scope-wide horizontal/trigger."""
+    name: str = "custom"
+    # Per-channel vertical settings, keyed by channel number.
+    channels: dict[int, ChannelSetup] = field(default_factory=dict)
+    # Used for any channel you ask for that isn't listed in `channels`.
+    default_channel: ChannelSetup = field(default_factory=ChannelSetup)
+    # Horizontal — GLOBAL to the scope, sent once.
+    # MANual lets you set sample rate and record length independently (this is the
+    # "Manual" shown in the scope's Acquisition badge). AUTO derives them for you.
+    horizontal_mode: str | None = None       # AUTO | MANual
+    sample_rate: float | None = None         # samples/s
+    horizontal_scale: float | None = None    # seconds/div
+    record_length: int | None = None
+    # Trigger position on the horizontal axis: percent of the record kept BEFORE the
+    # trigger (Tek default 10%). 10 => trigger sits 10% in from the left edge.
+    horizontal_position: float | None = None
+    # Acquisition — GLOBAL. SAMple is the plain "Sample" mode in the Acquisition badge.
+    acquire_mode: str | None = None          # SAMple | PEAKdetect | HIRes | AVErage | ENVelope
+    # Trigger — GLOBAL to the scope, sent once.
+    # MODE matters a lot for single-shot capture:
+    #   AUTO   - if no trigger arrives, the scope triggers ANYWAY after a timeout, so an
+    #            acquisition can complete WITHOUT your event ever happening.
+    #   NORMal - the scope waits indefinitely for the real trigger condition. This is
+    #            what you want when arming with --single to catch a specific event.
+    trigger_mode: str | None = None          # AUTO | NORMal
+    trigger_source: str | None = None
+    trigger_type: str | None = None          # EDGE (the only type supported)
+    trigger_level: float | None = None       # volts (or "half_battery" -> battery_voltage/2)
+    trigger_slope: str | None = None         # RISE | FALL
+    battery_voltage: float | None = None     # volts; used to resolve trigger_level "half_battery"
+    measurement: Any = None                  # what the test measures (metadata: "rms", "delay", ...)
+
+
+# ---------------------------------------------------------------------------
+# Named setups live as EDITABLE JSON files in the configs/ folder next to this
+# script (one file per setup: configs/<name>.json). Edit a value there and re-run;
+# nothing here needs to change. Add a new setup by dropping in a new .json file.
+#
+# JSON schema (all fields optional; null or omitted = leave that setting alone):
+#   {
+#     "name": "bench_full",                 # defaults to the filename if omitted
+#     "sample_rate": 250, "record_length": 10000, "horizontal_scale": 4.0,
+#     "horizontal_mode": "MANual", "horizontal_position": 10.0, "acquire_mode": "SAMple",
+#     "trigger_mode": "NORMal", "trigger_source": "CH1",
+#     "trigger_level": 6.8, "trigger_slope": "RISE",
+#     "default_channel": { "scale": 5.0, "coupling": "DC", ... },
+#     "channels": { "1": { "scale": 5.0, ... }, "2": { ... } }
+#   }
+# Any key starting with "_" (e.g. "_comment") is ignored, so you can annotate freely.
+# ---------------------------------------------------------------------------
+CONFIGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
+
+_CHANNEL_FIELDS = ("scale", "offset", "position", "coupling", "termination", "bandwidth")
+_SETUP_FIELDS = ("horizontal_mode", "sample_rate", "horizontal_scale", "record_length",
+                 "horizontal_position", "acquire_mode", "trigger_mode", "trigger_source",
+                 "trigger_type", "trigger_level", "trigger_slope", "battery_voltage",
+                 "measurement")
+
+# Spec-vocabulary aliases -> the canonical field name (so a config can read like the STP).
+_CHANNEL_ALIASES = {"vertical_scale": "scale", "vertical_resolution": "scale",
+                    "vertical_position": "position", "input_coupling": "coupling"}
+_SETUP_ALIASES = {"trigger_position": "horizontal_position"}
+
+# How each field's value is interpreted when it carries a unit string.
+_CHANNEL_KINDS = {"scale": "voltage", "offset": "voltage", "position": "number",
+                  "termination": "ohm", "bandwidth": "freq"}
+_SETUP_KINDS = {"sample_rate": "number", "horizontal_scale": "time", "record_length": "int",
+                "horizontal_position": "number", "trigger_level": "voltage",
+                "battery_voltage": "voltage"}
+
+
+def _parse_value(value: Any, kind: str | None):
+    """Coerce a config value to the type the scope expects. Plain numbers only, in the scope's
+    native units (horizontal_scale in seconds, scale in V/div, position in divisions, etc.)."""
+    if value is None:
+        return value
+    if kind == "ohm":
+        if isinstance(value, str) and "inf" in value.lower():
+            return "INFinity"
+        return float(value)
+    if kind == "int":
+        return int(round(float(value)))
+    return float(value)
+
+
+def _norm_enum(value: Any, kind: str) -> Any:
+    """Accept the STP's words for an enum (case-insensitive) and return the canonical value."""
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    if kind == "coupling":
+        return "DC" if v.startswith("dc") else "AC" if v.startswith("ac") else str(value).upper()
+    if kind == "slope":
+        if "ris" in v or "pos" in v:
+            return "RISE"
+        if "fall" in v or "neg" in v:
+            return "FALL"
+        return str(value).upper()
+    if kind == "mode":
+        return ("NORMal" if v.startswith("norm") else "AUTO" if v.startswith("auto")
+                else str(value).upper())
+    if kind == "source":
+        digits = "1" if "one" in v else "2" if "two" in v else "".join(c for c in v if c.isdigit())
+        return f"CH{digits}" if digits else str(value).upper()
+    if kind == "type":
+        return "EDGE"                                     # only Edge is supported
+    return value
+
+
+def _channel_from_dict(d: dict) -> ChannelSetup:
+    out: dict[str, Any] = {}
+    for key, val in d.items():
+        canon = _CHANNEL_ALIASES.get(key, key)
+        if canon not in _CHANNEL_FIELDS or val is None:
+            continue
+        out[canon] = _norm_enum(val, "coupling") if canon == "coupling" \
+            else _parse_value(val, _CHANNEL_KINDS.get(canon))
+    return ChannelSetup(**out)
+
+
+def _setup_from_dict(data: dict, fallback_name: str) -> ScopeSetup:
+    channels = {int(n): _channel_from_dict(cs)
+                for n, cs in (data.get("channels") or {}).items()}
+    default_channel = _channel_from_dict(data.get("default_channel") or {})
+
+    kwargs: dict[str, Any] = {}
+    _enum = {"trigger_slope": "slope", "trigger_mode": "mode", "trigger_source": "source",
+             "trigger_type": "type"}
+    for key, val in data.items():
+        canon = _SETUP_ALIASES.get(key, key)
+        if canon not in _SETUP_FIELDS or val is None:
+            continue
+        if canon in _enum:
+            kwargs[canon] = _norm_enum(val, _enum[canon])
+        elif canon in ("horizontal_mode", "acquire_mode", "measurement", "trigger_level"):
+            kwargs[canon] = val                           # trigger_level resolved below
+        else:
+            kwargs[canon] = _parse_value(val, _SETUP_KINDS.get(canon))
+
+    # Resolve trigger_level: a number/voltage string, or "half_battery" -> battery_voltage/2.
+    batt = kwargs.get("battery_voltage")
+    tl = kwargs.get("trigger_level")
+    if isinstance(tl, str):
+        if "batt" in tl.lower() or "half" in tl.lower():
+            kwargs["trigger_level"] = (batt / 2) if batt is not None else None
+        else:
+            kwargs["trigger_level"] = _parse_value(tl, "voltage")
+
+    setup = ScopeSetup(name=data.get("name") or fallback_name,
+                       channels=channels, default_channel=default_channel, **kwargs)
+    # Derive the sample rate when it isn't given (the STP lists record length + h-scale).
+    if setup.sample_rate is None and setup.record_length and setup.horizontal_scale:
+        setup.sample_rate = setup.record_length / (setup.horizontal_scale * 10)
+    return setup
+
+
+def load_setups(configs_dir: str = CONFIGS_DIR) -> dict[str, ScopeSetup]:
+    """Load every configs/<name>.json into a {name: ScopeSetup} dict.
+
+    The folder is the single source of truth for named setups. A missing folder or a
+    malformed file is reported (to stderr) rather than silently ignored, so a typo in a
+    config surfaces instead of a setup mysteriously vanishing.
+    """
+    setups: dict[str, ScopeSetup] = {}
+    if not os.path.isdir(configs_dir):
+        print(f"WARNING: configs folder not found: {configs_dir}\n"
+              f"         No named setups loaded. Create it with <name>.json files.",
+              file=sys.stderr)
+        return setups
+    for fn in sorted(os.listdir(configs_dir)):
+        if not fn.lower().endswith(".json"):
+            continue
+        path = os.path.join(configs_dir, fn)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            setup = _setup_from_dict(data, os.path.splitext(fn)[0])
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            print(f"WARNING: skipping bad config {fn}: {exc}", file=sys.stderr)
+            continue
+        setups[setup.name] = setup
+    return setups
+
+
+SETUPS: dict[str, ScopeSetup] = load_setups()
+DEFAULT_SETUP = SETUPS.get("default")   # kept for backwards compatibility (may be None)
+
+
+@dataclass
+class Setting:
+    label: str        # the SCPI header, e.g. "CH1:SCAle"
+    expected: Any     # the value we wrote
+    query: str        # the query to read it back, e.g. "CH1:SCAle?"
+
+
+@dataclass
+class CheckResult:
+    label: str
+    expected: Any
+    readback: str
+    ok: bool
+
+
+def _channel_number(channel: str) -> int:
+    digits = "".join(c for c in channel if c.isdigit())
+    return int(digits) if digits else 1
+
+
+def configure(scope: SocketScope, setup: ScopeSetup,
+              channels: list[int] | None = None,
+              duration: float | None = None) -> list[Setting]:
+    """Apply vertical/horizontal/trigger settings; return what was applied.
+
+    Vertical settings (scale/offset/coupling) are PER-CHANNEL, so they're applied to
+    every channel in `channels`. Horizontal and trigger settings are GLOBAL to the
+    scope, so they're sent once regardless of how many channels are listed.
+
+    duration : total seconds across the screen. If given, it OVERRIDES the setup's
+        timebase: we hold the setup's sample rate fixed and derive both the s/div and
+        the record length from it, so the user thinks in one intuitive number
+        (seconds) instead of s/div + record length. This is the scope's own Manual-
+        mode relationship: record_length = sample_rate * duration, s/div = duration/10.
+        The named setup itself is left untouched (we override locally, not in place).
+
+    The SCPI sent depends on the scope's vendor (detected at connect from *IDN?). The
+    same setup and the same returned Settings are used either way - only the commands
+    change, chosen by the `if ks:` branches below.
+    """
+    if channels is None:
+        channels = sorted(setup.channels) or [1]
+    settings: list[Setting] = []
+    ks = getattr(scope, "vendor", "tektronix") == "keysight"
+
+    # Effective timebase. Default to the setup's values; a duration override recomputes
+    # s/div and record length from it, keeping the setup's sample rate as the sampling
+    # resolution (more seconds -> more points, same points-per-second).
+    horizontal_scale = setup.horizontal_scale
+    record_length = setup.record_length
+    if duration is not None and duration > 0:
+        horizontal_scale = duration / 10.0                 # 10 divisions across the screen
+        if setup.sample_rate:
+            record_length = max(1, round(setup.sample_rate * duration))
+
+    def apply(base: str, value: Any) -> None:
+        scope.write(f"{base} {value}")
+        settings.append(Setting(base, value, f"{base}?"))
+
+    # Vertical — per channel, each using ITS OWN ChannelSetup.
+    for n in channels:
+        cs = setup.channels.get(n, setup.default_channel)
+        if ks:
+            ch = f"CHANnel{n}"
+            scope.write(f":{ch}:DISPlay ON")                # display on (returns 1/0, not verified)
+            if cs.scale is not None:
+                apply(f":{ch}:SCALe", cs.scale)
+            if cs.offset is not None:
+                apply(f":{ch}:OFFSet", cs.offset)
+            # position: Keysight has no divisions-based vertical position (it uses OFFSet in
+            # volts), so a `position` field is left to the Tektronix branch below.
+            if cs.coupling:
+                apply(f":{ch}:COUPling", _KS_COUPLING.get(cs.coupling.upper(), cs.coupling))
+            if cs.termination:
+                apply(f":{ch}:IMPedance", _ks_impedance(cs.termination))
+            # bandwidth: Keysight :CHANnel:BWLimit is only ON/OFF, so a Hz value does not
+            # map - left alone. Set it by hand if needed.
+        else:
+            ch = f"CH{n}"
+            scope.write(f"SELect:{ch} ON")
+            if cs.scale is not None:
+                apply(f"{ch}:SCAle", cs.scale)
+            if cs.offset is not None:
+                apply(f"{ch}:OFFSet", cs.offset)
+            if cs.position is not None:
+                apply(f"{ch}:POSition", cs.position)        # vertical position in divisions
+            if cs.coupling:
+                apply(f"{ch}:COUPling", cs.coupling)
+            if cs.termination:
+                apply(f"{ch}:TERmination", cs.termination)  # 1e6 = 1 MOhm, 50 = 50 Ohm
+            if cs.bandwidth:
+                apply(f"{ch}:BANdwidth", cs.bandwidth)      # e.g. 500e6 = 500 MHz
+
+    # Horizontal / acquisition / trigger — global, sent once.
+    if ks:
+        if horizontal_scale:
+            apply(":TIMebase:SCALe", horizontal_scale)      # value must be in the scope's range
+        # record length / memory depth is NOT settable over SCPI on InfiniiVision
+        # (:ACQuire:POINts is read-only, :ACQuire:MDEPth is undefined) - memory is auto and
+        # the transfer count is set at read time via :WAVeform:POINts. So nothing here.
+        # horizontal position (:TIMebase:REFerence) is not accepted on this family either;
+        # the trigger reference is left where it is. sample_rate/horizontal_mode are derived.
+        if setup.acquire_mode:
+            apply(":ACQuire:TYPE", _KS_ACQ_TYPE.get(setup.acquire_mode.upper(), setup.acquire_mode))
+        if setup.trigger_source:
+            apply(":TRIGger:MODE", "EDGE")
+            tn = _channel_number(setup.trigger_source)
+            apply(":TRIGger:EDGE:SOURce", f"CHAN{tn}")      # short form; readback is "CHAN1"
+            if setup.trigger_level is not None:
+                apply(":TRIGger:EDGE:LEVel", setup.trigger_level)
+            if setup.trigger_slope:
+                apply(":TRIGger:EDGE:SLOPe",
+                      _KS_SLOPE.get(setup.trigger_slope.upper(), setup.trigger_slope))
+        # Sweep mode LAST: selecting the edge trigger above can reset the sweep to NORMal,
+        # so applying AUTO/NORMal here makes the configured mode the one that sticks.
+        if setup.trigger_mode:
+            apply(":TRIGger:SWEep", setup.trigger_mode)     # AUTO / NORMal are the same words
+    else:
+        # MODE first: MANual must be set before sample rate / record length will stick.
+        if setup.horizontal_mode:
+            apply("HORizontal:MODE", setup.horizontal_mode)
+        if setup.sample_rate:
+            apply("HORizontal:SAMPLERate", setup.sample_rate)
+        if horizontal_scale:
+            apply("HORizontal:SCAle", horizontal_scale)
+        if record_length:
+            apply("HORizontal:RECOrdlength", record_length)
+        if setup.horizontal_position is not None:
+            apply("HORizontal:POSition", setup.horizontal_position)
+        if setup.acquire_mode:
+            apply("ACQuire:MODe", setup.acquire_mode)
+        if setup.trigger_source:
+            apply("TRIGger:A:TYPe", "EDGE")
+            apply("TRIGger:A:EDGE:SOUrce", setup.trigger_source)
+            if setup.trigger_level is not None:
+                tn = _channel_number(setup.trigger_source)
+                apply(f"TRIGger:A:LEVel:CH{tn}", setup.trigger_level)
+            if setup.trigger_slope:
+                apply("TRIGger:A:EDGE:SLOpe", setup.trigger_slope)
+        # A-trigger mode LAST: selecting the edge trigger above can reset the mode to NORMal,
+        # so applying AUTO/NORMal here makes the configured mode the one that sticks.
+        if setup.trigger_mode:
+            apply("TRIGger:A:MODe", setup.trigger_mode)
+
+    return settings
+
+
+def _matches(expected: Any, readback: str) -> bool:
+    """Compare a written value against its read-back, tolerant of formatting."""
+    text = readback.strip().strip('"')
+    if isinstance(expected, (int, float)):
+        try:
+            got = float(text)
+        except ValueError:
+            return False
+        return abs(got - float(expected)) <= 1e-9 + 1e-3 * abs(float(expected))
+    exp_s = str(expected).strip().strip('"').upper()
+    got_s = text.upper()
+    return exp_s == got_s or exp_s.startswith(got_s) or got_s.startswith(exp_s)
+
+
+def verify(scope: SocketScope, settings: list[Setting]) -> list[CheckResult]:
+    """Read every applied setting back off the scope and compare it to what we wrote."""
+    results: list[CheckResult] = []
+    for s in settings:
+        readback = scope.query(s.query)
+        results.append(CheckResult(s.label, s.expected, readback, _matches(s.expected, readback)))
+    return results
+
+
+def report(results: list[CheckResult]) -> bool:
+    """Print a PASS/FAIL table; return True only if every check passed."""
+    if not results:
+        print("no settings to verify")
+        return True
+    label_w = max(len(r.label) for r in results)
+    passed = sum(r.ok for r in results)
+    for r in results:
+        mark = "PASS" if r.ok else "FAIL"
+        print(f"  [{mark}] {r.label:<{label_w}}  set {str(r.expected):<12} "
+              f"readback {r.readback}")
+    total = len(results)
+    print(f"\n{passed}/{total} settings verified - "
+          f"{'ALL PASSED' if passed == total else 'SOME FAILED'}")
+    return passed == total
+
+
+# ---------------------------------------------------------------------------
+# Snapshot — the INVERSE of configure(). You dial the scope in by hand on the
+# front panel, then read those exact settings back off it and freeze them into a
+# configs/<name>.json. From then on that file drives the setup (no re-tuning).
+# ---------------------------------------------------------------------------
+def _q_num(scope: SocketScope, query: str) -> float | None:
+    """Query a numeric setting; None if the scope has nothing sensible to give."""
+    try:
+        return _to_float(scope.query(query))
+    except ValueError:
+        return None
+
+
+def _q_str(scope: SocketScope, query: str) -> str | None:
+    """Query a keyword setting (coupling, mode, slope...); None if empty."""
+    s = scope.query(query).strip().strip('"')
+    return s or None
+
+
+def _channel_on(scope: SocketScope, n: int) -> bool:
+    return scope.query(f"SELect:CH{n}?").strip() in ("1", "ON")
+
+
+def read_setup(scope: SocketScope, channels: list[int] | None = None,
+               name: str = "snapshot", max_channels: int = 4) -> ScopeSetup:
+    """Read the scope's CURRENT settings and build a ScopeSetup from them.
+
+    channels : which channels to capture. None = auto-detect the ones that are
+               displayed (SELect:CH<n>? == 1), falling back to CH1.
+    """
+    if channels is None:
+        channels = [n for n in range(1, max_channels + 1) if _channel_on(scope, n)] or [1]
+
+    chan_setups: dict[int, ChannelSetup] = {}
+    for n in channels:
+        chan_setups[n] = ChannelSetup(
+            scale=_q_num(scope, f"CH{n}:SCAle?"),
+            offset=_q_num(scope, f"CH{n}:OFFSet?"),
+            coupling=_q_str(scope, f"CH{n}:COUPling?"),
+            termination=_q_num(scope, f"CH{n}:TERmination?"),
+            bandwidth=_q_num(scope, f"CH{n}:BANdwidth?"),
+        )
+
+    trig_source = _q_str(scope, "TRIGger:A:EDGE:SOUrce?")
+    tn = _channel_number(trig_source) if trig_source else 1
+    rl = _q_num(scope, "HORizontal:RECOrdlength?")
+    return ScopeSetup(
+        name=name,
+        channels=chan_setups,
+        default_channel=chan_setups.get(channels[0], ChannelSetup()),
+        horizontal_mode=_q_str(scope, "HORizontal:MODE?"),
+        sample_rate=_q_num(scope, "HORizontal:SAMPLERate?"),
+        horizontal_scale=_q_num(scope, "HORizontal:SCAle?"),
+        record_length=int(rl) if rl is not None else None,
+        horizontal_position=_q_num(scope, "HORizontal:POSition?"),
+        acquire_mode=_q_str(scope, "ACQuire:MODe?"),
+        trigger_mode=_q_str(scope, "TRIGger:A:MODe?"),
+        trigger_source=trig_source,
+        trigger_level=_q_num(scope, f"TRIGger:A:LEVel:CH{tn}?"),
+        trigger_slope=_q_str(scope, "TRIGger:A:EDGE:SLOpe?"),
+    )
+
+
+def _channel_to_dict(cs: ChannelSetup) -> dict:
+    return {k: getattr(cs, k) for k in _CHANNEL_FIELDS if getattr(cs, k) is not None}
+
+
+def setup_to_dict(setup: ScopeSetup) -> dict:
+    """Serialize a ScopeSetup into the configs/*.json schema (round-trips load_setups)."""
+    d: dict[str, Any] = {"name": setup.name}
+    for f in _SETUP_FIELDS:
+        d[f] = getattr(setup, f)
+    d["default_channel"] = _channel_to_dict(setup.default_channel)
+    d["channels"] = {str(n): _channel_to_dict(cs)
+                     for n, cs in sorted(setup.channels.items())}
+    return d
+
+
+def save_setup_json(setup: ScopeSetup, path: str) -> str:
+    """Write a ScopeSetup to a JSON file; returns the path written."""
+    folder = os.path.dirname(os.path.abspath(path))
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(setup_to_dict(setup), fh, indent=2)
+        fh.write("\n")
+    print(f"saved setup '{setup.name}' to {path}")
+    return path
+
+
+def snapshot_to_configs(scope: SocketScope, name: str,
+                        channels: list[int] | None = None,
+                        configs_dir: str = CONFIGS_DIR) -> str:
+    """Read the scope's live settings and save them as configs/<name>.json."""
+    setup = read_setup(scope, channels, name=name)
+    return save_setup_json(setup, os.path.join(configs_dir, f"{name}.json"))
+
+
+@dataclass
+class Waveform:
+    channel: str
+    t: list[float]      # seconds
+    v: list[float]      # volts
+    dt: float
+    t0: float
+
+
+def _to_float(text: str) -> float:
+    """Parse a scope numeric reply, tolerating a stray HEADer prefix.
+
+    'HEADer OFF' at connect normally means replies are bare (e.g. '-2.0E-3'). This is a
+    backstop for the case where headers slip back on and the reply arrives as
+    ':WFMOUTPRE:XZERO -2.0E-3' - we take the last whitespace-separated token, then fall
+    back to pulling the first number out of the string.
+    """
+    s = text.strip()
+    try:
+        return float(s.split()[-1]) if s else float(s)
+    except ValueError:
+        m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
+        if m:
+            return float(m.group())
+        raise ValueError(f"could not parse a number from scope reply: {text!r}")
+
+
+def _query_nonempty(scope: SocketScope, cmd: str, tries: int = 3, delay: float = 0.3) -> str:
+    """Query, retrying while the reply is empty (rides out a transient Terminal-mode
+    timing hiccup). Returns '' if it is still empty after all tries."""
+    for i in range(tries):
+        reply = scope.query(cmd).strip()
+        if reply:
+            return reply
+        if i < tries - 1:
+            time.sleep(delay)
+    return ""
+
+
+def acquire(scope: SocketScope, channel: int = 1, points: int = 1000) -> Waveform | None:
+    """Pull an ASCII curve off a channel and scale it to a Waveform.
+
+    Returns None (rather than raising) when the source has no waveform to describe - the
+    channel is off, or the read happened before the record was ready. acquire_many() then
+    skips that channel with a note instead of failing the whole capture.
+
+    Vendor-aware: Keysight scopes use :WAVeform:* commands, Tektronix use WFMOutpre/CURVe.
+    Both return the same Waveform.
+    """
+    if getattr(scope, "vendor", "tektronix") == "keysight":
+        # --- Keysight: :WAVeform:PREamble? + :WAVeform:DATA? (ASCII = already in volts) ---
+        src = f"CHANnel{channel}"
+        scope.write(f":WAVeform:SOURce {src}")
+        scope.write(":WAVeform:FORMat ASCii")
+        scope.write(f":WAVeform:POINts {points}")
+        pre = _query_nonempty(scope, ":WAVeform:PREamble?")
+        if not pre:
+            print(f"CH{channel}: empty preamble - channel not displayed, or no acquisition yet.",
+                  file=sys.stderr)
+            return None
+        try:
+            # format,type,points,count,xincrement,xorigin,xreference,yincrement,yorigin,yreference
+            fields = [float(x) for x in pre.replace(";", ",").split(",") if x.strip()]
+        except ValueError:
+            return None
+        if len(fields) < 10:
+            return None
+        xincr, xorig, xref = fields[4], fields[5], fields[6]
+        raw = scope.query_raw(":WAVeform:DATA?").lstrip()
+        if raw.startswith("#"):                    # strip an IEEE definite-length block header
+            try:
+                ndig = int(raw[1])
+                raw = raw[2 + ndig:]
+            except (ValueError, IndexError):
+                pass
+        raw = re.sub(r"[^0-9eE+.\-,]", "", raw)     # keep only number/comma chars
+        v = [float(tok) for tok in raw.split(",") if tok]
+        if not v:
+            return None
+        t = [xorig + (i - xref) * xincr for i in range(len(v))]
+        return Waveform(f"CH{channel}", t, v, xincr, t[0])
+
+    # --- Tektronix: DATa:SOURce + WFMOutpre + CURVe? ---
+    source = f"CH{channel}"
+    scope.write(f"DATa:SOURce {source}")
+    scope.write("DATa:ENCdg ASCii")          # ASCII so the curve comes back as text
+    scope.write("DATa:STARt 1")
+    scope.write(f"DATa:STOP {points}")
+
+    def qf(field: str) -> float:
+        return _to_float(_query_nonempty(scope, f"WFMOutpre:{field}?"))
+
+    # XINCR is the first preamble field. An empty reply means there is no waveform on this
+    # source yet - bail out cleanly instead of crashing on float('').
+    if not _query_nonempty(scope, "WFMOutpre:XINCR?"):
+        print(f"CH{channel}: empty preamble - channel not displayed, or the record was not "
+              f"ready (did the acquisition complete before this read?).", file=sys.stderr)
+        return None
+
+    xincr = qf("XINCR")
+    xzero = qf("XZERO")
+    pt_off = int(qf("PT_OFF"))
+    ymult = qf("YMULT")
+    yoff = qf("YOFF")
+    yzero = qf("YZERO")
+
+    # Read the curve RAW (not line-cleaned): a big ASCII curve can arrive wrapped
+    # across many lines in Terminal mode. Drop the echoed command, then strip ALL
+    # whitespace before splitting on commas — that heals numbers split across a
+    # wrap boundary (e.g. "18\n0" -> "180") and removes any trailing prompt.
+    raw = scope.query_raw("CURVe?")
+    raw = re.sub(r"(?i)curve\?", "", raw)          # drop echoed command
+    raw = re.sub(r"[^0-9eE+.\-,]", "", raw)        # keep only number/comma chars
+    codes: list[float] = []
+    for tok in raw.split(","):
+        try:
+            codes.append(float(tok))
+        except ValueError:
+            pass
+    if not codes:
+        return None
+
+    v = [(c - yoff) * ymult + yzero for c in codes]
+    t = [xzero + (i - pt_off) * xincr for i in range(len(v))]
+    return Waveform(source, t, v, xincr, t[0])
+
+
+def summarize(wf: Waveform) -> None:
+    vmin, vmax = min(wf.v), max(wf.v)
+    print(f"Waveform: {len(wf.v)} samples on {wf.channel}")
+    print(f"  dt   = {wf.dt:g} s   t0 = {wf.t0:g} s")
+    print(f"  span = {wf.t[0]:g} .. {wf.t[-1]:g} s")
+    print(f"  Vpp  = {vmax - vmin:g} V  (min {vmin:g}, max {vmax:g})")
+
+
+# --- feature measurements on a Waveform ------------------------------------
+# Single source of truth for every metric, so the single-scope API and the
+# multi-scope (fleet) API measure identically. Each takes a Waveform.
+
+def measure_vmax(wf: Waveform) -> float:
+    return float(max(wf.v))
+
+
+def measure_vmin(wf: Waveform) -> float:
+    return float(min(wf.v))
+
+
+def measure_mean(wf: Waveform) -> float:
+    return float(sum(wf.v) / len(wf.v))
+
+
+def measure_rms(wf: Waveform) -> float:
+    """True RMS: sqrt(mean(v^2)) over the record. Works for any shape."""
+    return float((sum(x * x for x in wf.v) / len(wf.v)) ** 0.5)
+
+
+def _percentile(sorted_vals: list[float], pct: float) -> float:
+    """Linear-interpolation percentile of an ALREADY-SORTED list (pct in 0..100)."""
+    if not sorted_vals:
+        return 0.0
+    k = (len(sorted_vals) - 1) * (pct / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    return sorted_vals[lo] * (1 - (k - lo)) + sorted_vals[hi] * (k - lo)
+
+
+def _cross_time(t: list[float], v: list[float], i: int, level: float) -> float:
+    """Interpolated time where the segment v[i-1]..v[i] crosses `level`."""
+    v0, v1 = v[i - 1], v[i]
+    if v1 == v0:
+        return t[i]
+    return t[i - 1] + (level - v0) / (v1 - v0) * (t[i] - t[i - 1])
+
+
+def measure_pulse_width(wf: Waveform) -> float:
+    """Positive pulse width in seconds: how long the FIRST pulse stays high.
+
+    High/low levels come from the 10th/90th percentiles (robust to spikes, not raw
+    min/max). The threshold is the midpoint between them, with a 10% hysteresis band so
+    noise near the threshold does not double-count edges. Width is measured from the first
+    rising crossing to the following falling crossing, with crossing times interpolated
+    between samples. Returns 0.0 if the signal is flat or no complete high pulse is found.
+    """
+    v, t = wf.v, wf.t
+    n = len(v)
+    if n < 2:
+        return 0.0
+    s = sorted(v)
+    v_low = _percentile(s, 10.0)
+    v_high = _percentile(s, 90.0)
+    span = v_high - v_low
+    if span <= 0:
+        return 0.0                           # flat signal - no pulse
+    mid = (v_low + v_high) / 2.0
+    hi_th = mid + 0.1 * span                  # must exceed this to count as "high"
+    lo_th = mid - 0.1 * span                  # ...and drop below this to count as "low"
+    state_high = v[0] >= mid
+    rise_t: float | None = None
+    for i in range(1, n):
+        if not state_high and v[i] > hi_th:
+            state_high = True
+            rise_t = _cross_time(t, v, i, mid)
+        elif state_high and v[i] < lo_th:
+            state_high = False
+            if rise_t is not None:
+                return float(_cross_time(t, v, i, mid) - rise_t)
+    return 0.0                                # no complete positive pulse in the record
+
+
+def measure_pulse_width_negative(wf: Waveform) -> float:
+    """Negative (low) pulse width in seconds: how long the FIRST low pulse stays low.
+
+    The mirror of measure_pulse_width(): same robust 10/90-percentile levels, midpoint
+    threshold, and 10% hysteresis, but measured from the first falling crossing to the
+    following rising crossing. Returns 0.0 if the signal is flat or no complete low pulse
+    is found.
+    """
+    v, t = wf.v, wf.t
+    n = len(v)
+    if n < 2:
+        return 0.0
+    s = sorted(v)
+    v_low = _percentile(s, 10.0)
+    v_high = _percentile(s, 90.0)
+    span = v_high - v_low
+    if span <= 0:
+        return 0.0                           # flat signal - no pulse
+    mid = (v_low + v_high) / 2.0
+    hi_th = mid + 0.1 * span
+    lo_th = mid - 0.1 * span
+    state_high = v[0] >= mid
+    fall_t: float | None = None
+    for i in range(1, n):
+        if state_high and v[i] < lo_th:
+            state_high = False
+            fall_t = _cross_time(t, v, i, mid)
+        elif not state_high and v[i] > hi_th:
+            state_high = True
+            if fall_t is not None:
+                return float(_cross_time(t, v, i, mid) - fall_t)
+    return 0.0                                # no complete negative pulse in the record
+
+
+# --- on-scope measurement (delay between two channels) ---------------------
+# Unlike the feature measurements above, this one is computed by the INSTRUMENT and
+# shown on its own screen. It sends measurement SCPI, so it takes a live SocketScope
+# (not a Waveform) and needs no prior capture().
+
+def _norm_edge(edge: str) -> str:
+    """Normalize an edge word to 'RISE' or 'FALL'. Anything falling-ish -> 'FALL'."""
+    e = str(edge).strip().upper()
+    if e in ("FALL", "FALLING", "FALLINGEDGE", "NEG", "NEGATIVE", "-", "DOWN"):
+        return "FALL"
+    return "RISE"
+
+
+def _meas_float(reply: str) -> float:
+    """Parse an on-scope measurement reply to a float; NaN if absent or the instrument's
+    'no valid measurement' sentinel (~9.9E37)."""
+    try:
+        val = float(reply)
+    except (TypeError, ValueError):
+        return float("nan")
+    if abs(val) >= 9.9e37:
+        return float("nan")
+    return val
+
+
+def measure_delay(scope: SocketScope, source1: Any, source2: Any,
+                  edge1: str = "rising", edge2: str = "falling",
+                  direction: str = "forward") -> float:
+    """Measure the delay between two channels and DISPLAY it on the scope's screen.
+
+    This is an ON-SCOPE measurement: the instrument times the chosen edge on source1 to
+    the chosen edge on source2, posts a delay badge on its own display, and returns the
+    value. It does NOT use a captured Waveform - it programs the scope's measurement
+    system directly, so it works on the live signal (no capture() needed first).
+
+    source1, source2 : the FROM and TO channels - a number (1) or a name ("CH2"/"2").
+    edge1, edge2     : which edge to time on each source, "rising" or "falling". Any
+                       combination works (rising->falling, falling->falling, ...).
+    direction        : "forward" (time to the NEXT source2 edge, default) or "backward".
+
+    Returns the delay in seconds (positive = the source2 edge comes AFTER the source1
+    edge). The badge stays on the scope screen until the measurement is cleared. On
+    Tektronix this replaces the on-screen measurement table (it clears it first) so the
+    slot is predictable; on Keysight the delay is added to the measurement readout.
+    """
+    n1 = _channel_number(str(source1))
+    n2 = _channel_number(str(source2))
+    e1 = _norm_edge(edge1)
+    e2 = _norm_edge(edge2)
+    ks = getattr(scope, "vendor", "tektronix") == "keysight"
+
+    if ks:
+        # InfiniiVision: define the slope+occurrence for each source, then measure the
+        # delay between the two channels (the query both measures and posts it on screen).
+        s1 = "+" if e1 == "RISE" else "-"
+        s2 = "+" if e2 == "RISE" else "-"
+        scope.write(f":MEASure:DEFine DELay,{s1}1,{s2}1")   # slope,occurrence per source
+        reply = scope.query(f":MEASure:DELay? CHANnel{n1},CHANnel{n2}")
+    else:
+        # TekScope (MSO 2/4-series): add a DELAY measurement badge, aim it at the two
+        # channels and edges, and read its current value.
+        te1 = "RISe" if e1 == "RISE" else "FALL"
+        te2 = "RISe" if e2 == "RISE" else "FALL"
+        tdir = "FORWard" if str(direction).strip().lower().startswith("f") else "BACKward"
+        scope.write("MEASUrement:DELETEALL")                 # clear the table -> MEAS1 is ours
+        scope.write('MEASUrement:ADDNew "MEAS1"')
+        scope.write("MEASUrement:MEAS1:TYPe DELay")
+        scope.write(f"MEASUrement:MEAS1:SOUrce1 CH{n1}")
+        scope.write(f"MEASUrement:MEAS1:SOUrce2 CH{n2}")
+        scope.write(f"MEASUrement:MEAS1:DELay:EDGE1 {te1}")
+        scope.write(f"MEASUrement:MEAS1:DELay:EDGE2 {te2}")
+        scope.write(f"MEASUrement:MEAS1:DELay:DIRection {tdir}")
+        # TODO(confirm): value query + edge/direction subcommands vary by firmware -
+        # verify MEASUrement:MEAS1:RESUlts:CURRentacq:MEAN? against the live MSO.
+        reply = scope.query("MEASUrement:MEAS1:RESUlts:CURRentacq:MEAN?")
+
+    return _meas_float(reply)
+
+
+# --- CSV formatting -------------------------------------------------------
+# One place that decides how numbers look, so every CSV (per-channel and joint)
+# is formatted identically and the columns line up.
+
+def _time_decimals(dt: float) -> int:
+    """How many decimal places to print for the time column.
+
+    Derived from the sample step dt so consecutive timestamps are distinguishable
+    AND every row uses the SAME number of decimals (an aligned, monotonic column
+    that never flips into scientific notation). ~3 extra digits below dt.
+    """
+    if not dt or dt <= 0:
+        return 9
+    return min(15, max(3, int(math.ceil(-math.log10(abs(dt)))) + 3))
+
+
+def _fmt_time(t: float, decimals: int) -> str:
+    return f"{t:.{decimals}f}"
+
+
+def _fmt_volts(v: float) -> str:
+    return f"{v:.6g}"
+
+
+def save_csv(wf: Waveform, path: str) -> None:
+    """Write one scaled waveform as CSV, columns: index, time_s, volts.
+
+    Rows are in time order; the time column uses a fixed decimal count (from dt) so
+    it stays aligned and readable in a spreadsheet.
+    """
+    import csv
+    dec = _time_decimals(wf.dt)
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["index", "time_s", "volts"])
+        for i, (t, v) in enumerate(zip(wf.t, wf.v)):
+            writer.writerow([i, _fmt_time(t, dec), _fmt_volts(v)])
+    print(f"saved {len(wf.v)} samples to {path}")
+
+
+def ascii_plot(wf: Waveform, width: int = 70, height: int = 21) -> None:
+
+    
+    v, n = wf.v, len(wf.v)
+    vmin, vmax = _v_range(v)              # pads a flat signal so it sits mid-plot
+    span = vmax - vmin
+    grid = [[" "] * width for _ in range(height)]
+
+    def row_of(val: float) -> int:
+        return max(0, min(height - 1, round((vmax - val) / span * (height - 1))))
+
+    # zero line first, so samples draw over it
+    if vmin <= 0 <= vmax:
+        grid[row_of(0.0)] = ["-"] * width
+
+    for col in range(width):
+        lo = col * n // width
+        hi = max(lo + 1, (col + 1) * n // width)
+        seg = v[lo:hi]
+        top, bot = row_of(max(seg)), row_of(min(seg))   # min..max of this column's samples
+        for r in range(top, bot + 1):
+            grid[r][col] = "*"
+
+    # ASCII only (the Windows console can't render box-drawing characters).
+    print(f"  {vmax:+.3g} V +" + "-" * width)
+    for r in grid:
+        print("           |" + "".join(r))
+    print(f"  {vmin:+.3g} V +" + "-" * width)
+    print(f"             {wf.t[0]:g} s{' ' * max(1, width - 14)}{wf.t[-1]:g} s")
+
+
+# ===========================================================================
+# PNG output.
+#
+# matplotlib is OPTIONAL. If it is installed we use it (nicer axes/fonts). If it
+# is not, we fall back to a built-in renderer that writes a real PNG using only
+# the standard library (zlib + struct). That keeps this script's promise: it runs
+# with ZERO pip installs, which matters on a locked-down TestStand machine.
+# ===========================================================================
+
+# A tiny 5x7 bitmap font - just the characters the axis labels and legend need.
+_FONT: dict[str, list[str]] = {
+    "0": [".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."],
+    "1": ["..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."],
+    "2": [".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"],
+    "3": [".###.", "#...#", "....#", "..##.", "....#", "#...#", ".###."],
+    "4": ["...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."],
+    "5": ["#####", "#....", "####.", "....#", "....#", "#...#", ".###."],
+    "6": ["..##.", ".#...", "#....", "####.", "#...#", "#...#", ".###."],
+    "7": ["#####", "....#", "...#.", "..#..", ".#...", ".#...", ".#..."],
+    "8": [".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."],
+    "9": [".###.", "#...#", "#...#", ".####", "....#", "...#.", ".##.."],
+    ".": [".....", ".....", ".....", ".....", ".....", ".##..", ".##.."],
+    "-": [".....", ".....", ".....", "#####", ".....", ".....", "....."],
+    "+": [".....", "..#..", "..#..", "#####", "..#..", "..#..", "....."],
+    "e": [".....", ".....", ".###.", "#...#", "#####", "#....", ".###."],
+    "V": ["#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#.."],
+    "s": [".....", ".....", ".####", "#....", ".###.", "....#", "####."],
+    "C": [".###.", "#...#", "#....", "#....", "#....", "#...#", ".###."],
+    "H": ["#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
+    ":": [".....", ".##..", ".##..", ".....", ".##..", ".##..", "....."],
+    " ": [".....", ".....", ".....", ".....", ".....", ".....", "....."],
+}
+
+# One colour per channel, in channel order.
+_TRACE_COLORS = [(198, 156, 0), (0, 150, 200), (200, 60, 60), (60, 160, 60)]
+
+
+def _v_range(values: list[float]) -> tuple[float, float]:
+    """The voltage range to plot over.
+
+    A perfectly FLAT signal (e.g. a zero waveform) has vmin == vmax, which would
+    otherwise put the trace exactly on the plot border and make it invisible - or
+    divide by zero. Pad it symmetrically so a flat line is drawn down the MIDDLE.
+    """
+    vmin, vmax = min(values), max(values)
+    if vmax == vmin:
+        pad = abs(vmax) * 0.1 or 1.0        # 10% of the level, or +/-1 V at exactly 0
+        vmin, vmax = vmin - pad, vmax + pad
+    return vmin, vmax
+
+
+class _Canvas:
+    """A tiny RGB pixel canvas that can write itself out as a real PNG."""
+
+    def __init__(self, w: int, h: int, bg: tuple[int, int, int] = (255, 255, 255)) -> None:
+        self.w, self.h = w, h
+        self.buf = bytearray(bytes(bg) * (w * h))
+
+    def px(self, x: int, y: int, c: tuple[int, int, int]) -> None:
+        if 0 <= x < self.w and 0 <= y < self.h:
+            i = (y * self.w + x) * 3
+            self.buf[i:i + 3] = bytes(c)
+
+    def hline(self, x0: int, x1: int, y: int, c) -> None:
+        for x in range(min(x0, x1), max(x0, x1) + 1):
+            self.px(x, y, c)
+
+    def vline(self, x: int, y0: int, y1: int, c) -> None:
+        for y in range(min(y0, y1), max(y0, y1) + 1):
+            self.px(x, y, c)
+
+    def line(self, x0: int, y0: int, x1: int, y1: int, c) -> None:
+        """Bresenham - used when there are fewer samples than pixel columns."""
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        while True:
+            self.px(x0, y0, c)
+            if x0 == x1 and y0 == y1:
+                return
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+
+    def rect(self, x0: int, y0: int, x1: int, y1: int, c) -> None:
+        self.hline(x0, x1, y0, c)
+        self.hline(x0, x1, y1, c)
+        self.vline(x0, y0, y1, c)
+        self.vline(x1, y0, y1, c)
+
+    def text(self, x: int, y: int, s: str, c, scale: int = 2) -> None:
+        cx = x
+        for ch in s:
+            glyph = _FONT.get(ch, _FONT[" "])
+            for ry, row in enumerate(glyph):
+                for rx, bit in enumerate(row):
+                    if bit == "#":
+                        for sy in range(scale):
+                            for sx in range(scale):
+                                self.px(cx + rx * scale + sx, y + ry * scale + sy, c)
+            cx += 6 * scale
+        return
+
+    def save(self, path: str) -> None:
+        """Encode as an 8-bit RGB PNG. Pure stdlib: zlib + struct."""
+        raw = bytearray()
+        for y in range(self.h):
+            raw.append(0)                       # per-scanline filter type 0 (None)
+            i = y * self.w * 3
+            raw += self.buf[i:i + self.w * 3]
+
+        def chunk(tag: bytes, data: bytes) -> bytes:
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+        ihdr = struct.pack(">IIBBBBB", self.w, self.h, 8, 2, 0, 0, 0)  # 8-bit truecolour
+        png = (b"\x89PNG\r\n\x1a\n"
+               + chunk(b"IHDR", ihdr)
+               + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+               + chunk(b"IEND", b""))
+        with open(path, "wb") as fh:
+            fh.write(png)
+
+
+def _render_png(waves: dict[int, Waveform], path: str) -> None:
+    """Draw the waveform(s) and write a PNG - no third-party libraries at all."""
+    W, H = 960, 420
+    L, R, T, B = 84, 22, 34, 48           # margins
+    pw, ph = W - L - R, H - T - B
+
+    GRID, AXIS, TXT, ZERO = (228, 228, 228), (90, 90, 90), (40, 40, 40), (175, 175, 175)
+    cv = _Canvas(W, H)
+
+    chans = sorted(waves)
+    all_v = [val for c in chans for val in waves[c].v]
+    vmin, vmax = _v_range(all_v)          # pads a flat signal so it sits mid-plot
+    span = vmax - vmin
+    t = waves[chans[0]].t
+
+    def Y(v: float) -> int:
+        return T + int((vmax - v) / span * (ph - 1))
+
+    # grid, zero line, axes box
+    for k in range(1, 10):
+        cv.vline(L + k * pw // 10, T, T + ph, GRID)
+    for k in range(1, 8):
+        cv.hline(L, L + pw, T + k * ph // 8, GRID)
+    if vmin <= 0 <= vmax:
+        cv.hline(L, L + pw, Y(0.0), ZERO)
+    cv.rect(L, T, L + pw, T + ph, AXIS)
+
+    # traces
+    for idx, c in enumerate(chans):
+        col = _TRACE_COLORS[idx % len(_TRACE_COLORS)]
+        v, n = waves[c].v, len(waves[c].v)
+        if n >= pw:
+            # more samples than pixels: draw each column's min..max so peaks survive
+            for xcol in range(pw):
+                lo = xcol * n // pw
+                hi = max(lo + 1, (xcol + 1) * n // pw)
+                seg = v[lo:hi]
+                cv.vline(L + xcol, Y(max(seg)), Y(min(seg)), col)
+        else:
+            # fewer samples than pixels: join them up so the trace stays continuous
+            for i in range(n - 1):
+                x0 = L + i * (pw - 1) // max(1, n - 1)
+                x1 = L + (i + 1) * (pw - 1) // max(1, n - 1)
+                cv.line(x0, Y(v[i]), x1, Y(v[i + 1]), col)
+
+    # labels
+    cv.text(4, T - 4, f"{vmax:.3g} V", TXT)
+    cv.text(4, T + ph - 10, f"{vmin:.3g} V", TXT)
+    cv.text(L, T + ph + 12, f"{t[0]:.3g} s", TXT)
+    cv.text(L + pw - 90, T + ph + 12, f"{t[-1]:.3g} s", TXT)
+
+    # legend, in each trace's colour
+    lx = L + 8
+    for idx, c in enumerate(chans):
+        name = waves[c].channel
+        cv.text(lx, 8, name, _TRACE_COLORS[idx % len(_TRACE_COLORS)])
+        lx += 6 * 2 * (len(name) + 1)
+
+    cv.save(path)
+
+
+def _write_png(waves: dict[int, Waveform], path: str, label: str = "") -> bool:
+    """Write a PNG of one or more waveforms. Always succeeds - matplotlib optional.
+
+    label : an optional source name (e.g. a scope alias) shown in the plot title, so an
+            opened PNG says WHICH instrument it came from.
+    """
+    chans = sorted(waves)
+    channels = ", ".join(waves[c].channel for c in chans)
+    title = f"{label}: {channels}" if label else f"Capture: {channels}"
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        _render_png(waves, path)          # built-in, zero dependencies
+        print(f"saved plot to {path}  (built-in renderer; "
+              f"'pip install matplotlib' for a nicer one)")
+        return True
+
+    plt.figure(figsize=(10, 4.5))
+    for c in chans:
+        plt.plot(waves[c].t, waves[c].v, linewidth=0.8, label=waves[c].channel)
+    plt.xlabel("time (s)")
+    plt.ylabel("volts")
+    plt.title(title)
+    if len(chans) > 1:
+        plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close()
+    print(f"saved plot to {path}")
+    return True
+
+
+def save_png(wf: Waveform, path: str, label: str = "") -> bool:
+    """Save a PNG plot of one waveform. Works with or without matplotlib. `label` names the
+    source (e.g. a scope alias) in the plot title."""
+    return _write_png({_channel_number(wf.channel): wf}, path, label)
+
+
+# ---------------------------------------------------------------------------
+# Multi-channel: capture several channels, then emit BOTH per-channel outputs
+# and a joint (all-channels-together) output.
+# ---------------------------------------------------------------------------
+def _derive(path: str, suffix: str) -> str:
+    """'wave.csv' + 'CH1' -> 'wave_CH1.csv'."""
+    root, ext = os.path.splitext(path)
+    return f"{root}_{suffix}{ext}"
+
+
+def acquire_many(scope: SocketScope, channels: list[int],
+                 points: int = 1000) -> dict[int, Waveform]:
+    """Capture each channel in turn, ALL from the same frozen record.
+
+    Every channel is read with its own DATa:SOURce + WFMOutpre + CURVe. If the scope is
+    still running, the record can change between the CH1 read and the CH2 read, leaving the
+    channels on DIFFERENT time windows (CH1 from one acquisition, CH2 from a later one).
+    So we STOP the scope first to freeze ONE record, read every channel off it, then resume
+    the run state. This guarantees all channels share one acquisition and one time axis.
+
+    Channels with no data are skipped (with a note).
+    """
+    was_running = is_running(scope)
+    if was_running:
+        scope.write("ACQuire:STATE STOP")     # freeze one record for a coherent read
+    try:
+        waves: dict[int, Waveform] = {}
+        for ch in channels:
+            wf = acquire(scope, ch, points)
+            if wf is None:
+                print(f"CH{ch}: no curve data - is the channel displayed and acquiring?",
+                      file=sys.stderr)
+                continue
+            waves[ch] = wf
+    finally:
+        if was_running:
+            scope.write("ACQuire:STATE RUN")   # leave the scope as we found it (live)
+    return waves
+
+
+def capture_live(scope: SocketScope, channels: list[int],
+                 points: int = 1000, settle: float = 1.0) -> dict[int, Waveform]:
+    """Force a fresh, frozen record and read every channel off it - vendor-aware.
+
+    Puts the scope in AUTO (self-trigger) so a record fills even when nothing satisfies the
+    configured trigger (e.g. a NORMal edge that never arrives, or a flat input), waits `settle`
+    for it to acquire, STOPs to freeze that one record, reads every channel from it, then
+    leaves the scope live again. This is what makes capture work on a Keysight configured with
+    a NORMal trigger, where simply reading the current record returns an empty preamble.
+
+    Tektronix uses ACQuire:STATE / TRIGger:A:MODe; Keysight uses :RUN/:STOP / :TRIGger:SWEep.
+    """
+    ks = getattr(scope, "vendor", "tektronix") == "keysight"
+    if ks:
+        scope.write(":TRIGger:SWEep AUTO")        # self-trigger; don't wait for an edge
+        scope.write(":RUN")
+        time.sleep(settle)
+        scope.write(":STOP")                       # freeze one record for a coherent read
+    else:
+        scope.write("TRIGger:A:MODe AUTO")
+        scope.write("ACQuire:STOPAfter RUNSTop")   # continuous, not single-sequence
+        scope.write("ACQuire:STATE RUN")
+        time.sleep(settle)
+        scope.write("ACQuire:STATE STOP")
+    try:
+        waves: dict[int, Waveform] = {}
+        for ch in channels:
+            wf = acquire(scope, ch, points)
+            if wf is None:
+                print(f"CH{ch}: no curve data - is the channel displayed and acquiring?",
+                      file=sys.stderr)
+                continue
+            waves[ch] = wf
+    finally:
+        if ks:
+            scope.write(":RUN")                    # leave the scope live
+        else:
+            scope.write("ACQuire:STATE RUN")
+    return waves
+
+
+def save_joint_csv(waves: dict[int, Waveform], path: str) -> None:
+    """One CSV holding every channel against a shared time column.
+
+    Channels are laid out left-to-right in ascending order (CH1, CH2, ...); the time
+    column is formatted the same way as the per-channel files so everything aligns.
+    """
+    import csv
+    chans = sorted(waves)
+    n = min(len(waves[c].v) for c in chans)
+    t = waves[chans[0]].t
+    dec = _time_decimals(waves[chans[0]].dt)
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["index", "time_s"] + [f"{waves[c].channel}_volts" for c in chans])
+        for i in range(n):
+            writer.writerow([i, _fmt_time(t[i], dec)] + [_fmt_volts(waves[c].v[i]) for c in chans])
+    print(f"saved joint CSV ({len(chans)} channels x {n} samples) to {path}")
+
+
+def ascii_plot_joint(waves: dict[int, Waveform], width: int = 70, height: int = 21) -> None:
+    """Overlay every channel on one ASCII plot, sharing a single voltage axis."""
+    chans = sorted(waves)
+    symbols = ["*", "+", "o", "x"]
+    marks = {c: symbols[i % len(symbols)] for i, c in enumerate(chans)}
+
+    all_v = [val for c in chans for val in waves[c].v]
+    vmin, vmax = _v_range(all_v)          # pads a flat signal so it sits mid-plot
+    span = vmax - vmin
+    grid = [[" "] * width for _ in range(height)]
+
+    def row_of(val: float) -> int:
+        return max(0, min(height - 1, round((vmax - val) / span * (height - 1))))
+
+    if vmin <= 0 <= vmax:
+        grid[row_of(0.0)] = ["-"] * width
+
+    for c in chans:
+        v, n, mark = waves[c].v, len(waves[c].v), marks[c]
+        for col in range(width):
+            lo = col * n // width
+            hi = max(lo + 1, (col + 1) * n // width)
+            seg = v[lo:hi]
+            for r in range(row_of(max(seg)), row_of(min(seg)) + 1):
+                cur = grid[r][col]
+                # '#' marks where channels overlap
+                grid[r][col] = mark if cur in (" ", "-", mark) else "#"
+
+    t = waves[chans[0]].t
+    legend = "  ".join(f"{marks[c]}={waves[c].channel}" for c in chans) + "  #=overlap"
+    print(f"  {vmax:+.3g} V +" + "-" * width)
+    for r in grid:
+        print("           |" + "".join(r))
+    print(f"  {vmin:+.3g} V +" + "-" * width)
+    print(f"             {t[0]:g} s{' ' * max(1, width - 14)}{t[-1]:g} s")
+    print(f"             {legend}")
+
+
+def save_png_joint(waves: dict[int, Waveform], path: str, label: str = "") -> bool:
+    """One PNG with every channel overlaid on a shared voltage axis, with a legend.
+    `label` names the source (e.g. a scope alias) in the plot title.
+
+    Works with or without matplotlib (falls back to the built-in renderer).
+    """
+    return _write_png(waves, path, label)
+
+
+# ---------------------------------------------------------------------------
+# Acquisition control.
+#
+# --capture only READS whatever record is already in the scope's memory. That is
+# fine if the scope is Stopped (the record is frozen and stays there indefinitely),
+# but if the scope is Running the record gets overwritten by each new trigger.
+#
+# is_running()  -> lets us warn about that.
+# arm_single()  -> makes it deterministic: arm ONE acquisition, wait for the
+#                  trigger and the record to fill, and only then read.
+# ---------------------------------------------------------------------------
+def is_running(scope: SocketScope) -> bool:
+    """True if the scope is currently acquiring (so its record can change under us)."""
+    return scope.query("ACQuire:STATE?").strip().upper() in ("1", "ON", "RUN")
+
+
+def wait_until_stopped(scope: SocketScope, timeout: float = 120.0,
+                       poll: float = 0.5) -> bool:
+    """Block until the scope has STOPPED acquiring (the record is complete), or timeout.
+
+    Returns True the moment acquisition finishes; False if it never stops within `timeout`
+    (which usually means the trigger never fired, so the record was never written).
+    """
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        if not is_running(scope):
+            return True
+        time.sleep(poll)      # explicit interval - do not spin on the scope
+    return False
+
+
+def free_run(scope: SocketScope, timeout: float = 60.0, poll: float = 0.5) -> bool:
+    """Put the scope in continuous AUTO acquisition and wait for ONE fresh record.
+
+    Use this when you just want whatever the scope is showing - including a flat or
+    zero signal that would never satisfy a real trigger. AUTO makes the scope
+    self-trigger, so a record always fills.
+
+    We then STOP the scope, so the record is frozen while we read it back (our read
+    takes several queries, and a running scope would overwrite it mid-read).
+    """
+    scope.write("TRIGger:A:MODe AUTO")          # self-trigger; don't wait for an edge
+    scope.write("ACQuire:STOPAfter RUNSTop")    # continuous, not single-sequence
+    scope.write("ACQuire:STATE RUN")
+
+    def num_acq() -> int:
+        try:
+            return int(float(scope.query("ACQuire:NUMACq?") or 0))
+        except ValueError:
+            return 0
+
+    start_n = num_acq()
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        time.sleep(poll)
+        if num_acq() > start_n:                 # a NEW record has completed
+            scope.write("ACQuire:STATE STOP")   # freeze it so the read is consistent
+            print(f"  free-run: got a fresh record after "
+                  f"{time.monotonic() - start:.1f} s")
+            return True
+    return False
+
+
+def arm_acquisition(scope: SocketScope) -> bool:
+    """Arm ONE acquisition and return IMMEDIATELY (does not wait for the trigger).
+
+    Use this to catch an event that happens AFTER you arm: the scope waits for the
+    trigger, captures a single record, and STOPS (freezes) it. The armed state lives
+    on the scope itself, so the event is captured even if nothing is polling - you can
+    read the frozen record later with a plain capture (single=False). Returns True
+    once the arm command is sent.
+    """
+    # In AUTO mode the scope force-triggers after a timeout, so the record can fill
+    # WITHOUT your event ever happening. Warn loudly - this is a trap.
+    mode = scope.query("TRIGger:A:MODe?").strip().upper()
+    if mode.startswith("AUTO"):
+        print("WARNING: trigger mode is AUTO. The scope will trigger by itself after a\n"
+              "         timeout, so the record may fill WITHOUT your event.\n"
+              "         Use a setup with trigger_mode='NORMal' (e.g. --setup bench_full),\n"
+              "         or send: --query \"TRIGger:A:MODe NORMal\"", file=sys.stderr)
+
+    scope.write("ACQuire:STOPAfter SEQuence")   # one shot, do not free-run
+    scope.write("ACQuire:STATE RUN")            # arm it; returns without waiting
+    return True
+
+
+def arm_single(scope: SocketScope, timeout: float = 120.0, poll: float = 0.5) -> bool:
+    """Arm exactly ONE acquisition and BLOCK until it completes.
+
+    Same arm as arm_acquisition(), then polls ACQuire:STATE? until the scope reports
+    stopped. Returns False if it never completed within `timeout` (the trigger never
+    fired). Only use this when the event occurs DURING this call; if the event happens
+    later (e.g. a separate step generates it), use arm_acquisition() before it instead.
+    """
+    arm_acquisition(scope)
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        if not is_running(scope):
+            print(f"  acquisition complete after {time.monotonic() - start:.1f} s")
+            return True
+        time.sleep(poll)    # explicit poll interval - do not spin on the scope
+    return False
+
+
+def capture(scope: SocketScope, channels: list[int], points: int = 1000, *,
+            save: str | None = None, plot: bool = False,
+            plot_png: str | None = None, single: bool = False,
+            free: bool = False, timeout: float = 120.0) -> int:
+    if free:
+        print(f"Free-run: AUTO trigger + continuous acquisition; waiting up to "
+              f"{timeout:g} s for one fresh record...")
+        if not free_run(scope, timeout):
+            print(f"no fresh record within {timeout:g} s. Is the scope able to acquire? "
+                  f"(a slow timebase needs a long record - e.g. 250 S/s x 10 kpts = 40 s)",
+                  file=sys.stderr)
+            return 1
+    elif single:
+        print(f"Arming a single acquisition; waiting up to {timeout:g} s for the "
+              f"trigger and the record to fill...")
+        if not arm_single(scope, timeout):
+            print(f"acquisition did not complete within {timeout:g} s - did the trigger "
+                  f"ever fire?", file=sys.stderr)
+            return 1
+    elif is_running(scope):
+        print("WARNING: the scope is RUNNING, so the record can be overwritten while we "
+              "read it.\n         Stop the scope, or use --single for a deterministic "
+              "capture.", file=sys.stderr)
+
+    waves = acquire_many(scope, channels, points)
+    if not waves:
+        print("no curve data from any channel (is a signal being acquired?)",
+              file=sys.stderr)
+        return 1
+
+    multi = len(waves) > 1
+
+    # --- per-channel outputs ---
+    for c in sorted(waves):
+        wf = waves[c]
+        print(f"--- {wf.channel} ---")
+        summarize(wf)
+        if save:
+            save_csv(wf, _derive(save, wf.channel) if multi else save)
+        if plot:
+            ascii_plot(wf)
+        if plot_png:
+            save_png(wf, _derive(plot_png, wf.channel) if multi else plot_png)
+        print()
+
+    # --- joint outputs (only meaningful with 2+ channels) ---
+    if multi:
+        print("--- JOINT (all channels) ---")
+        if save:
+            save_joint_csv(waves, _derive(save, "joint"))
+        if plot:
+            ascii_plot_joint(waves)
+        if plot_png:
+            save_png_joint(waves, _derive(plot_png, "joint"))
+    return 0
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Talk to the MSO44B over its raw Socket Server (no VISA needed).",
+    )
+    parser.add_argument("--host", default=None,
+                        help="Scope IP address (overrides the SCOPE_HOST env var).")
+    parser.add_argument("--port", type=int, default=5025,
+                        help="Socket Server port. Default: 4000.")
+    parser.add_argument("--identify", action="store_true",
+                        help="Query *IDN? and print the scope's identity (the default).")
+    parser.add_argument("--configure", action="store_true",
+                        help="Apply a setup (see --setup) and print a read-back PASS/FAIL table.")
+    parser.add_argument("--setup", default="default", metavar="NAME",
+                        help="Which named setup --configure applies. Default: 'default'. "
+                             "See --list-setups.")
+    parser.add_argument("--list-setups", action="store_true",
+                        help="Print the available named setups and exit.")
+    parser.add_argument("--snapshot", metavar="NAME", default=None,
+                        help="Read the scope's CURRENT front-panel settings and save them "
+                             "as configs/NAME.json (the inverse of --configure). Use "
+                             "--channels to pick channels, else the displayed ones are used.")
+    parser.add_argument("--capture", action="store_true",
+                        help="Pull an ASCII waveform off a channel and summarise it.")
+    parser.add_argument("--channel", type=int, default=None,
+                        help="Single channel for --configure/--capture. If omitted, "
+                             "--configure uses the setup's own channels and --capture uses CH1.")
+    parser.add_argument("--channels", default=None, metavar="LIST",
+                        help="Comma-separated channels for --capture, e.g. 1,2. Each is "
+                             "captured separately AND combined into joint outputs.")
+    parser.add_argument("--points", type=int, default=1000,
+                        help="Number of samples to transfer for --capture. Default: 1000.")
+    parser.add_argument("--duration", type=float, default=None, metavar="SECONDS",
+                        help="With --configure: total seconds the capture should span. "
+                             "Overrides the setup's timebase - holds its sample rate and "
+                             "recomputes s/div and record length from the duration.")
+    parser.add_argument("--single", action="store_true",
+                        help="With --capture: arm ONE acquisition and wait for it to "
+                             "complete before reading. Use this to deterministically "
+                             "capture the NEXT event instead of whatever is in memory.")
+    parser.add_argument("--free-run", action="store_true",
+                        help="With --capture: put the scope in AUTO + continuous "
+                             "acquisition, wait for one fresh record, then read it. "
+                             "Use this to grab whatever is on screen - including a flat "
+                             "or zero signal that would never fire a real trigger.")
+    parser.add_argument("--timeout", type=float, default=120.0, metavar="SEC",
+                        help="With --single: how long to wait for the acquisition to "
+                             "complete. Default: 120 seconds.")
+    parser.add_argument("--save", metavar="CSV", default=None,
+                        help="With --capture: save to CSV. Multi-channel writes one file per "
+                             "channel (wave_CH1.csv, ...) plus a joint wave_joint.csv.")
+    parser.add_argument("--plot", action="store_true",
+                        help="With --capture: ASCII plot in the terminal (no libraries). "
+                             "Multi-channel also draws a joint overlay plot.")
+    parser.add_argument("--plot-png", metavar="PNG", default=None,
+                        help="With --capture: save a PNG. Uses matplotlib if installed, "
+                             "otherwise a built-in renderer (no packages needed). "
+                             "Multi-channel writes one PNG per channel plus a joint one.")
+    parser.add_argument("--query", metavar="SCPI", default=None,
+                        help="Send an arbitrary SCPI query and print the reply.")
+    parser.add_argument("--send", metavar="SCPI", default=None,
+                        help="Send an arbitrary SCPI COMMAND (no reply expected), e.g. "
+                             "--send \"TRIGger:A:MODe AUTO\".")
+    parser.add_argument("--debug", action="store_true",
+                        help="Also print the raw (uncleaned) reply to stderr.")
+    return parser.parse_args(argv)
+
+
+def _print_setups() -> None:
+    def chan_desc(cs: ChannelSetup) -> str:
+        bits = [f"{cs.scale} V/div"]
+        if cs.coupling:
+            bits.append(cs.coupling)
+        if cs.termination:
+            bits.append("1 MOhm" if cs.termination >= 1e6 else f"{cs.termination:g} Ohm")
+        if cs.bandwidth:
+            bits.append(f"{cs.bandwidth / 1e6:g} MHz")
+        return "/".join(bits)
+
+    for name, s in SETUPS.items():
+        print(f"  {name}")
+        for n, cs in sorted(s.channels.items()):
+            print(f"      CH{n}      : {chan_desc(cs)}")
+        print(f"      horizontal: {s.horizontal_scale} s/div, {s.sample_rate} S/s, "
+              f"{s.record_length} pts, pos {s.horizontal_position}%"
+              + (f", mode {s.horizontal_mode}" if s.horizontal_mode else ""))
+        print(f"      trigger  : {s.trigger_source} @ {s.trigger_level} V {s.trigger_slope}")
+        if s.acquire_mode:
+            print(f"      acquire  : {s.acquire_mode}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+
+    if args.list_setups:
+        print("Available setups (use --setup NAME):")
+        _print_setups()
+        return 0
+
+    host = args.host or os.environ.get("SCOPE_HOST")
+    if not host:
+        print("No scope host. Pass --host <ip> or set SCOPE_HOST.", file=sys.stderr)
+        return 2
+
+    try:
+        scope = SocketScope(host, args.port)
+    except OSError as exc:
+        print(f"Could not connect to {host}:{args.port} - {exc}", file=sys.stderr)
+        print("Is the scope's Socket Server ON (Protocol = Terminal) on that port?",
+              file=sys.stderr)
+        return 1
+
+    # --channels (e.g. "1,2") wins; then a single --channel; else CH1 for capture.
+    if args.channels:
+        channels = [int(c) for c in args.channels.split(",") if c.strip()]
+    elif args.channel is not None:
+        channels = [args.channel]
+    else:
+        channels = [1]
+
+    try:
+        if args.send:
+            scope.write(args.send)
+            print(f"sent: {args.send}")
+            return 0
+        if args.query:
+            print(scope.query(args.query, debug=args.debug))
+            return 0
+        if args.snapshot:
+            # User-specified channels win; otherwise auto-detect the displayed ones.
+            snap_channels = channels if (args.channels or args.channel is not None) else None
+            print("IDN:", scope.query("*IDN?"))
+            snapshot_to_configs(scope, args.snapshot, snap_channels)
+            print(f"Snapshot saved. Use it with: --setup {args.snapshot}  "
+                  f"(or configure('{args.snapshot}') in TestStand).")
+            return 0
+        if args.configure:
+            setup = SETUPS.get(args.setup)
+            if setup is None:
+                print(f"Unknown setup {args.setup!r}. Available: "
+                      f"{', '.join(SETUPS)}", file=sys.stderr)
+                return 2
+            # With no --channel/--channels, configure exactly the channels the setup defines.
+            cfg_channels = channels if (args.channels or args.channel is not None) \
+                else (sorted(setup.channels) or [1])
+            print("IDN:", scope.query("*IDN?"))
+            applied = configure(scope, setup, cfg_channels, duration=args.duration)
+            names = ", ".join(f"CH{c}" for c in cfg_channels)
+            print(f"Applied {len(applied)} settings from setup '{setup.name}' to {names}. "
+                  f"Reading them back:\n")
+            return 0 if report(verify(scope, applied)) else 1
+        if args.capture:
+            return capture(scope, channels, args.points,
+                           save=args.save, plot=args.plot, plot_png=args.plot_png,
+                           single=args.single, free=args.free_run,
+                           timeout=args.timeout)
+        # default action is identify
+        print("IDN:", scope.query("*IDN?", debug=args.debug))
+        return 0
+    finally:
+        scope.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
