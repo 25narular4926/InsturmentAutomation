@@ -736,6 +736,37 @@ def afg_set_dwell(alias: str, channel: int = 1, high_dwell: float = 0.0,
     return passed == len(results)
 
 
+def afg_set_modulation(alias: str, channel: int = 1, modulation: str = "AM",
+                       rate: float = 0.0, depth: float = 0.0, deviation: float = 0.0,
+                       shape: str = "", source: str = "") -> bool:
+    """Configure modulation on one channel and verify. modulation is "AM"/"FM"/"PM"/"PWM"
+    (or "OFF"). rate = internal modulating frequency (Hz). depth = AM/PWM percent;
+    deviation = FM Hz / PM degrees. shape = modulating-function shape; source = INT/EXT.
+    Values <= 0 (or empty strings) are left unset. Does NOT switch the output on.
+    """
+    gen = _require_afg(alias)
+    cw = afg.ChannelWaveform(
+        modulation=str(modulation),
+        mod_rate=float(rate) if rate and rate > 0 else None,
+        mod_depth=float(depth) if depth and depth > 0 else None,
+        mod_deviation=float(deviation) if deviation and deviation > 0 else None,
+        mod_shape=str(shape) if shape else None,
+        mod_source=str(source) if source else None,
+    )
+    setup = afg.WaveformSetup(name="modulation", channels={int(channel): cw})
+    applied = afg.configure(gen, setup, [int(channel)])
+    results = afg.verify(gen, applied)
+
+    passed = sum(1 for r in results if r.ok)
+    lines = [f"[{alias}] CH{channel} modulation set ({modulation})", ""]
+    width = max((len(r.label) for r in results), default=0)
+    for r in results:
+        mark = "PASS" if r.ok else "FAIL"
+        lines.append(f"[{mark}] {r.label:<{width}}  set {r.expected}  readback {r.readback}")
+    _afg_reports[alias] = "\n".join(lines)
+    return passed == len(results)
+
+
 def afg_load_arbitrary(alias: str, channel: int = 1, name: str = "") -> bool:
     """Load a named/stored arbitrary waveform onto a channel and select it as the output shape.
 

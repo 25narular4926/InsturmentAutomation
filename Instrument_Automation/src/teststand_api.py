@@ -368,6 +368,23 @@ def set_function_gen_dwell(alias: str, channel: int = 1, high_dwell: float = 0.0
     return _fleet.afg_set_dwell(alias, int(channel), float(high_dwell), float(low_dwell))
 
 
+def set_function_gen_modulation(alias: str, channel: int = 1, modulation: str = "AM",
+                                rate: float = 0.0, depth: float = 0.0, deviation: float = 0.0,
+                                shape: str = "", source: str = "") -> bool:
+    """Configure modulation on one generator channel and verify.
+
+    modulation : "AM" | "FM" | "PM" | "PWM"  (or "OFF" to disable modulation).
+    rate       : internal modulating frequency in Hz.
+    depth      : AM depth or PWM duty deviation, in PERCENT (used for AM / PWM).
+    deviation  : FM deviation in Hz, or PM deviation in degrees (used for FM / PM).
+    shape      : modulating-function shape (SIN/SQUare/TRIangle/RAMP); source: INT/EXT.
+    Values <= 0 or empty are left unset. Does NOT switch the output on. Returns True only if
+    every setting verified.
+    """
+    return _fleet.afg_set_modulation(alias, int(channel), str(modulation), float(rate),
+                                     float(depth), float(deviation), str(shape), str(source))
+
+
 def load_arbitrary_waveform(alias: str, channel: int = 1, name: str = "") -> bool:
     """Load a named/stored arbitrary waveform onto a channel and select it as the output.
 

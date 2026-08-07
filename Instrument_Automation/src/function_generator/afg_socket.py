@@ -210,6 +210,17 @@ class ChannelWaveform:
     # dwell, width = high_dwell. Set BOTH together.
     high_dwell: float | None = None          # seconds held at the high level
     low_dwell: float | None = None           # seconds held at the low level
+    # Modulation (AM / FM / PM / PWM). `modulation` is the type ("AM"/"FM"/"PM"/"PWM", or
+    # "OFF" to disable). mod_rate is the internal modulating frequency (Hz), mod_shape its
+    # shape (SINusoid/SQUare/TRIangle/RAMP/...). Depth/deviation depend on the type:
+    #   AM  -> mod_depth (percent)          FM -> mod_deviation (Hz)
+    #   PM  -> mod_deviation (degrees)      PWM -> mod_depth (percent duty deviation)
+    modulation: str | None = None            # AM | FM | PM | PWM | OFF
+    mod_source: str | None = None            # INTernal | EXTernal (default INTernal)
+    mod_shape: str | None = None             # internal modulating-function shape
+    mod_rate: float | None = None            # Hz - internal modulating frequency
+    mod_depth: float | None = None           # percent (AM depth / PWM duty deviation)
+    mod_deviation: float | None = None       # Hz (FM) or degrees (PM)
 
 
 @dataclass
@@ -223,14 +234,20 @@ CONFIGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs"
 
 _CHANNEL_FIELDS = ("shape", "frequency", "amplitude", "offset", "duty_cycle",
                    "phase", "impedance", "pulse_rate", "pulse_width",
-                   "pulse_high_voltage", "pulse_low_voltage", "high_dwell", "low_dwell")
+                   "pulse_high_voltage", "pulse_low_voltage", "high_dwell", "low_dwell",
+                   "modulation", "mod_source", "mod_shape", "mod_rate",
+                   "mod_depth", "mod_deviation")
+
+# Fields that stay strings (everything else is coerced to a number).
+_STRING_FIELDS = ("shape", "modulation", "mod_source", "mod_shape")
 
 # How each field's value is interpreted when it carries a unit string.
 _AFG_KINDS = {"frequency": "freq", "amplitude": "voltage", "offset": "voltage",
               "duty_cycle": "number", "phase": "number", "impedance": "ohm",
               "pulse_rate": "time", "pulse_width": "time",
               "pulse_high_voltage": "voltage", "pulse_low_voltage": "voltage",
-              "high_dwell": "time", "low_dwell": "time"}
+              "high_dwell": "time", "low_dwell": "time",
+              "mod_rate": "freq", "mod_depth": "number", "mod_deviation": "number"}
 
 
 def _parse_value(value: Any, kind: str | None):
@@ -249,7 +266,7 @@ def _channel_from_dict(d: dict) -> ChannelWaveform:
     out: dict[str, Any] = {}
     for key, val in d.items():
         if key in _CHANNEL_FIELDS and val is not None:
-            out[key] = val if key == "shape" else _parse_value(val, _AFG_KINDS.get(key))
+            out[key] = val if key in _STRING_FIELDS else _parse_value(val, _AFG_KINDS.get(key))
     return ChannelWaveform(**out)
 
 
@@ -362,6 +379,31 @@ def configure(afg: SocketAFG, setup: WaveformSetup,
         if cw.high_dwell is not None and cw.low_dwell is not None:
             apply(f"{src}:PULSe:PERiod", cw.high_dwell + cw.low_dwell)
             apply(f"{src}:PULSe:WIDTh", cw.high_dwell)
+        # Modulation (AM/FM/PM/PWM). Only one modulation is active at a time; "OFF" disables
+        # all of them. Depth/deviation are applied per type (AM/PWM: mod_depth percent;
+        # FM: mod_deviation Hz; PM: mod_deviation degrees).
+        if cw.modulation is not None:
+            mod = str(cw.modulation).strip().upper()
+            if mod in ("OFF", "NONE", "NORMAL"):
+                for m in ("AM", "FM", "PM", "PWM"):
+                    afg.write(f"{src}:{m}:STATe OFF")   # disable, not verified (clears state)
+            else:
+                mtype = {"PWD": "PWM"}.get(mod, mod)      # tolerate a common misspelling
+                apply(f"{src}:{mtype}:STATe", "ON")
+                if cw.mod_source:
+                    apply(f"{src}:{mtype}:SOURce", cw.mod_source)
+                if cw.mod_shape:
+                    apply(f"{src}:{mtype}:INTernal:FUNCtion", cw.mod_shape)
+                if cw.mod_rate is not None:
+                    apply(f"{src}:{mtype}:INTernal:FREQuency", cw.mod_rate)
+                if mtype == "AM" and cw.mod_depth is not None:
+                    apply(f"{src}:AM:DEPTh", cw.mod_depth)                 # percent
+                elif mtype == "FM" and cw.mod_deviation is not None:
+                    apply(f"{src}:FM:DEViation", cw.mod_deviation)         # Hz
+                elif mtype == "PM" and cw.mod_deviation is not None:
+                    apply(f"{src}:PM:DEViation", cw.mod_deviation)         # degrees
+                elif mtype == "PWM" and cw.mod_depth is not None:
+                    apply(f"{src}:PWM:DEViation:DCYCle", cw.mod_depth)     # percent duty deviation
 
     return settings
 
