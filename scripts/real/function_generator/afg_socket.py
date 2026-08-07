@@ -205,6 +205,11 @@ class ChannelWaveform:
     pulse_width: float | None = None         # seconds (high time, e.g. "950 ms")
     pulse_high_voltage: float | None = None  # volts
     pulse_low_voltage: float | None = None   # volts
+    # Dwell (hold time at each level) - e.g. an accelerator-pedal deadband trapezoid: hold
+    # HIGH for high_dwell, hold LOW for low_dwell. Realized as a PULSe: period = high+low
+    # dwell, width = high_dwell. Set BOTH together.
+    high_dwell: float | None = None          # seconds held at the high level
+    low_dwell: float | None = None           # seconds held at the low level
 
 
 @dataclass
@@ -218,13 +223,14 @@ CONFIGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs"
 
 _CHANNEL_FIELDS = ("shape", "frequency", "amplitude", "offset", "duty_cycle",
                    "phase", "impedance", "pulse_rate", "pulse_width",
-                   "pulse_high_voltage", "pulse_low_voltage")
+                   "pulse_high_voltage", "pulse_low_voltage", "high_dwell", "low_dwell")
 
 # How each field's value is interpreted when it carries a unit string.
 _AFG_KINDS = {"frequency": "freq", "amplitude": "voltage", "offset": "voltage",
               "duty_cycle": "number", "phase": "number", "impedance": "ohm",
               "pulse_rate": "time", "pulse_width": "time",
-              "pulse_high_voltage": "voltage", "pulse_low_voltage": "voltage"}
+              "pulse_high_voltage": "voltage", "pulse_low_voltage": "voltage",
+              "high_dwell": "time", "low_dwell": "time"}
 
 
 def _parse_value(value: Any, kind: str | None):
@@ -351,8 +357,31 @@ def configure(afg: SocketAFG, setup: WaveformSetup,
             apply(f"{src}:VOLTage:HIGH", cw.pulse_high_voltage)
         if cw.pulse_low_voltage is not None:
             apply(f"{src}:VOLTage:LOW", cw.pulse_low_voltage)
+        # Dwell: hold HIGH for high_dwell, LOW for low_dwell -> a PULSe whose PERiod is the
+        # sum and whose WIDTh is the high dwell. Set both together (period must exceed width).
+        if cw.high_dwell is not None and cw.low_dwell is not None:
+            apply(f"{src}:PULSe:PERiod", cw.high_dwell + cw.low_dwell)
+            apply(f"{src}:PULSe:WIDTh", cw.high_dwell)
 
     return settings
+
+
+def load_arbitrary(afg: SocketAFG, channel: int, name: str) -> bool:
+    """Load a named arbitrary waveform onto a channel and select it as the output shape.
+
+    `name` is a waveform FILE or stored-waveform NAME already present on the AFG (created /
+    uploaded separately, e.g. via the front panel or ArbExpress). This loads it into edit
+    memory and points the channel's output at it. Returns True once the shape reads back as
+    the arbitrary (edit-memory) function.
+
+    TODO(confirm): the exact MMEMory/FUNCtion tokens vary by AFG firmware - verify
+    MMEMory:LOAD:TRACe and FUNCtion:SHAPe EMEMory against the live AFG31102.
+    """
+    src = f"SOURce{channel}"
+    afg.write(f'MMEMory:LOAD:TRACe EMEMory,"{name}"')     # file/name -> edit memory
+    afg.write(f"{src}:FUNCtion:SHAPe EMEMory")            # output the arbitrary (edit-memory) shape
+    shape = afg.query(f"{src}:FUNCtion:SHAPe?").strip().upper()
+    return shape.startswith("EMEM") or shape.startswith("USER") or shape.startswith("ARB")
 
 
 def _matches(expected: Any, readback: str) -> bool:

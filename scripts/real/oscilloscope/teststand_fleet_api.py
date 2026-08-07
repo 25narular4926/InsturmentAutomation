@@ -500,6 +500,36 @@ def get_delay(alias: str, source1: int = 1, source2: int = 2,
                             str(edge1), str(edge2), str(direction))
 
 
+def get_frequency(alias: str, channel: int = 1) -> float:
+    """Frequency in Hz (from successive rising edges). 0.0 if no complete cycle."""
+    return bs.measure_frequency(_require_wave(alias, int(channel)))
+
+
+def get_period(alias: str, channel: int = 1) -> float:
+    """Period in seconds (mean rising-edge interval). 0.0 if no complete cycle."""
+    return bs.measure_period(_require_wave(alias, int(channel)))
+
+
+def get_duty_cycle(alias: str, channel: int = 1) -> float:
+    """Positive duty cycle in percent (mean high-time / period). 0.0 if no complete cycle."""
+    return bs.measure_duty_cycle(_require_wave(alias, int(channel)))
+
+
+def get_high_voltage(alias: str, channel: int = 1) -> float:
+    """High level in volts (90th percentile - robust, not raw max)."""
+    return bs.measure_v_high(_require_wave(alias, int(channel)))
+
+
+def get_low_voltage(alias: str, channel: int = 1) -> float:
+    """Low level in volts (10th percentile - robust, not raw min)."""
+    return bs.measure_v_low(_require_wave(alias, int(channel)))
+
+
+def get_dc_voltage(alias: str, channel: int = 1) -> float:
+    """DC level in volts = the mean over the record (same as get_mean)."""
+    return bs.measure_mean(_require_wave(alias, int(channel)))
+
+
 def get_sample_count(alias: str, channel: int = 1) -> int:
     """How many samples were transferred."""
     return int(len(_require_wave(alias, int(channel)).v))
@@ -653,6 +683,66 @@ def afg_set_waveform(alias: str, channel: int = 1, shape: str = "SIN",
         lines.append(f"[{mark}] {r.label:<{width}}  set {r.expected}  readback {r.readback}")
     _afg_reports[alias] = "\n".join(lines)
     return passed == len(results)
+
+
+def afg_set_levels(alias: str, channel: int = 1, high_voltage: float = 0.0,
+                   low_voltage: float = 0.0, frequency: float = 0.0) -> bool:
+    """Set one generator channel by HIGH/LOW voltage levels (and optional frequency), verified.
+
+    An alternative to amplitude+offset: the level is given as its high and low volts
+    (SOURce:VOLTage:HIGH / :LOW). frequency is sent only when > 0. Does NOT switch the output
+    on. Returns True only if every setting read back correctly.
+    """
+    gen = _require_afg(alias)
+    cw = afg.ChannelWaveform(
+        pulse_high_voltage=float(high_voltage),
+        pulse_low_voltage=float(low_voltage),
+        frequency=float(frequency) if frequency and frequency > 0 else None,
+    )
+    setup = afg.WaveformSetup(name="levels", channels={int(channel): cw})
+    applied = afg.configure(gen, setup, [int(channel)])
+    results = afg.verify(gen, applied)
+
+    passed = sum(1 for r in results if r.ok)
+    lines = [f"[{alias}] CH{channel} levels set directly", ""]
+    width = max((len(r.label) for r in results), default=0)
+    for r in results:
+        mark = "PASS" if r.ok else "FAIL"
+        lines.append(f"[{mark}] {r.label:<{width}}  set {r.expected}  readback {r.readback}")
+    _afg_reports[alias] = "\n".join(lines)
+    return passed == len(results)
+
+
+def afg_set_dwell(alias: str, channel: int = 1, high_dwell: float = 0.0,
+                  low_dwell: float = 0.0) -> bool:
+    """Configure dwell (hold times) on one channel and verify: hold HIGH for high_dwell, LOW
+    for low_dwell. Realized as a PULSe (period = high+low dwell, width = high dwell). Both
+    are required. Does NOT switch the output on. Returns True only if every setting verified.
+    """
+    gen = _require_afg(alias)
+    cw = afg.ChannelWaveform(shape="PULSe",
+                             high_dwell=float(high_dwell), low_dwell=float(low_dwell))
+    setup = afg.WaveformSetup(name="dwell", channels={int(channel): cw})
+    applied = afg.configure(gen, setup, [int(channel)])
+    results = afg.verify(gen, applied)
+
+    passed = sum(1 for r in results if r.ok)
+    lines = [f"[{alias}] CH{channel} dwell set (high {high_dwell}s / low {low_dwell}s)", ""]
+    width = max((len(r.label) for r in results), default=0)
+    for r in results:
+        mark = "PASS" if r.ok else "FAIL"
+        lines.append(f"[{mark}] {r.label:<{width}}  set {r.expected}  readback {r.readback}")
+    _afg_reports[alias] = "\n".join(lines)
+    return passed == len(results)
+
+
+def afg_load_arbitrary(alias: str, channel: int = 1, name: str = "") -> bool:
+    """Load a named/stored arbitrary waveform onto a channel and select it as the output shape.
+
+    `name` is a waveform file or stored-waveform name already on the AFG. Returns True once
+    the channel's shape reads back as the arbitrary (edit-memory) function.
+    """
+    return afg.load_arbitrary(_require_afg(alias), int(channel), str(name))
 
 
 def afg_get_config_report(alias: str) -> str:

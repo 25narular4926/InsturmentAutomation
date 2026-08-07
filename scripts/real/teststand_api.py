@@ -232,6 +232,36 @@ def scope_delay(alias: str, source1: int = 1, source2: int = 2,
                             str(edge1), str(edge2), str(direction))
 
 
+def scope_frequency(alias: str, channel: int = 1) -> float:
+    """Frequency in Hz (from successive rising edges); 0.0 if no complete cycle."""
+    return _fleet.get_frequency(alias, int(channel))
+
+
+def scope_period(alias: str, channel: int = 1) -> float:
+    """Period in seconds (mean rising-edge interval); 0.0 if no complete cycle."""
+    return _fleet.get_period(alias, int(channel))
+
+
+def scope_duty_cycle(alias: str, channel: int = 1) -> float:
+    """Positive duty cycle in percent (mean high-time / period); 0.0 if no complete cycle."""
+    return _fleet.get_duty_cycle(alias, int(channel))
+
+
+def scope_high_voltage(alias: str, channel: int = 1) -> float:
+    """High level in volts (90th percentile - robust, not raw max)."""
+    return _fleet.get_high_voltage(alias, int(channel))
+
+
+def scope_low_voltage(alias: str, channel: int = 1) -> float:
+    """Low level in volts (10th percentile - robust, not raw min)."""
+    return _fleet.get_low_voltage(alias, int(channel))
+
+
+def scope_dc_voltage(alias: str, channel: int = 1) -> float:
+    """DC level in volts = the mean over the record (same as scope_mean)."""
+    return _fleet.get_dc_voltage(alias, int(channel))
+
+
 def scope_sample_count(alias: str, channel: int = 1) -> int:
     """How many samples were transferred on a captured channel."""
     return _fleet.get_sample_count(alias, int(channel))
@@ -313,6 +343,39 @@ def set_function_gen_waveform(alias: str, channel: int = 1, shape: str = "SIN",
     """
     return _fleet.afg_set_waveform(alias, int(channel), str(shape), float(frequency),
                                    float(amplitude), float(offset), float(duty_cycle))
+
+
+def set_function_gen_levels(alias: str, channel: int = 1, high_voltage: float = 0.0,
+                            low_voltage: float = 0.0, frequency: float = 0.0) -> bool:
+    """Set one generator channel by HIGH/LOW voltage (and optional frequency), verified.
+
+    The level-based alternative to set_function_gen_waveform's amplitude+offset: give the
+    high and low volts directly (they define the amplitude and offset). frequency is applied
+    only when > 0. Does NOT switch the output on. Returns True only if every setting verified.
+    """
+    return _fleet.afg_set_levels(alias, int(channel), float(high_voltage),
+                                 float(low_voltage), float(frequency))
+
+
+def set_function_gen_dwell(alias: str, channel: int = 1, high_dwell: float = 0.0,
+                           low_dwell: float = 0.0) -> bool:
+    """Configure dwell (hold times): hold HIGH for high_dwell seconds, LOW for low_dwell.
+
+    For a trapezoid/accelerator-pedal-style stimulus. Realized as a PULSe (period = high+low
+    dwell, width = high dwell). Both required. Does NOT switch the output on. Returns True
+    only if every setting verified.
+    """
+    return _fleet.afg_set_dwell(alias, int(channel), float(high_dwell), float(low_dwell))
+
+
+def load_arbitrary_waveform(alias: str, channel: int = 1, name: str = "") -> bool:
+    """Load a named/stored arbitrary waveform onto a channel and select it as the output.
+
+    `name` is a waveform file or stored-waveform name already present on the AFG (created or
+    uploaded separately). Returns True once the channel's shape reads back as the arbitrary
+    (edit-memory) function. Call function_gen_output_on() afterwards to drive it.
+    """
+    return _fleet.afg_load_arbitrary(alias, int(channel), str(name))
 
 
 def get_function_gen_config_report(alias: str) -> str:

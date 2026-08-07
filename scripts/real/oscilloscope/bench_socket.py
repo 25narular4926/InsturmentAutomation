@@ -965,6 +965,91 @@ def measure_pulse_width_negative(wf: Waveform) -> float:
     return 0.0                                # no complete negative pulse in the record
 
 
+def _edge_times(wf: Waveform) -> tuple[list[float], list[float]]:
+    """Interpolated mid-level crossing times: (rising_times, falling_times).
+
+    Same robust scheme as the pulse-width measurements: high/low levels from the 10th/90th
+    percentiles (not raw min/max), threshold at the midpoint with a 10% hysteresis band so
+    noise near the threshold does not double-count edges, crossing times interpolated between
+    samples. Returns two empty lists if the signal is flat.
+    """
+    v, t = wf.v, wf.t
+    n = len(v)
+    if n < 2:
+        return [], []
+    s = sorted(v)
+    v_low = _percentile(s, 10.0)
+    v_high = _percentile(s, 90.0)
+    span = v_high - v_low
+    if span <= 0:
+        return [], []
+    mid = (v_low + v_high) / 2.0
+    hi_th = mid + 0.1 * span
+    lo_th = mid - 0.1 * span
+    rising: list[float] = []
+    falling: list[float] = []
+    state_high = v[0] >= mid
+    for i in range(1, n):
+        if not state_high and v[i] > hi_th:
+            state_high = True
+            rising.append(_cross_time(t, v, i, mid))
+        elif state_high and v[i] < lo_th:
+            state_high = False
+            falling.append(_cross_time(t, v, i, mid))
+    return rising, falling
+
+
+def measure_period(wf: Waveform) -> float:
+    """Period in seconds: mean interval between successive rising edges. 0.0 if < 2 edges."""
+    rising, _ = _edge_times(wf)
+    if len(rising) < 2:
+        return 0.0
+    return float((rising[-1] - rising[0]) / (len(rising) - 1))
+
+
+def measure_frequency(wf: Waveform) -> float:
+    """Frequency in Hz = 1 / period (from successive rising edges). 0.0 if no full cycle."""
+    period = measure_period(wf)
+    return float(1.0 / period) if period > 0 else 0.0
+
+
+def measure_duty_cycle(wf: Waveform) -> float:
+    """Positive duty cycle in PERCENT: mean high-time / period over the record.
+
+    High time is each rising edge to its next falling edge; period is the rising-edge period.
+    Returns 0.0 if there is no complete cycle.
+    """
+    rising, falling = _edge_times(wf)
+    if len(rising) < 2 or not falling:
+        return 0.0
+    period = (rising[-1] - rising[0]) / (len(rising) - 1)
+    if period <= 0:
+        return 0.0
+    highs: list[float] = []
+    for rt in rising:
+        nxt = next((ft for ft in falling if ft > rt), None)
+        if nxt is not None:
+            highs.append(nxt - rt)
+    if not highs:
+        return 0.0
+    high_time = sum(highs) / len(highs)
+    return float(100.0 * high_time / period)
+
+
+def measure_v_high(wf: Waveform) -> float:
+    """High level (volts): 90th percentile of the samples - robust to spikes, not raw max."""
+    if not wf.v:
+        return 0.0
+    return float(_percentile(sorted(wf.v), 90.0))
+
+
+def measure_v_low(wf: Waveform) -> float:
+    """Low level (volts): 10th percentile of the samples - robust to spikes, not raw min."""
+    if not wf.v:
+        return 0.0
+    return float(_percentile(sorted(wf.v), 10.0))
+
+
 # --- on-scope measurement (delay between two channels) ---------------------
 # Unlike the feature measurements above, this one is computed by the INSTRUMENT and
 # shown on its own screen. It sends measurement SCPI, so it takes a live SocketScope

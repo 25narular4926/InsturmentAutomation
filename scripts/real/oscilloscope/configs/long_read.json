@@ -1,0 +1,34 @@
+{
+  "_comment": "Long full-window capture in AUTO mode - read a signal over a wide window (seconds) and transfer the WHOLE record. Uses MANual timebase (horizontal_mode) so record_length + sample_rate are AUTHORITATIVE: the acquired record equals what you capture, instead of the scope auto-managing a huge record and the read pulling only a sliver (what dc_read did at 100 kS/s). record_length 10000 (a valid Tek record length) at 333.33 S/s = a 30 s window (10000 / 333.33). For other windows at 10000 pts, change sample_rate: 250 -> 40 s, 500 -> 20 s, 1000 -> 10 s, 200 -> 50 s, 100 -> 100 s. AUTO trigger (free-runs; a signal with no clean edge). CH1 DC 5 V/div, 1 MOhm (automotive levels). Use: configure_scope(alias, 'long_read', '1') then capture_scope(alias, '1'). Verify with get_scope_config_report - the scope quantizes sample_rate to its nearest achievable, but record_length stays 10000 so the full window still transfers. Do NOT also pass duration_s here (MANual derives s/div from record_length + sample_rate).",
+  "name": "long_read",
+  "record_length": 10000,
+  "horizontal_mode": "MANual",
+  "trigger_position": 10,
+  "sample_rate": 333.33,
+  "trigger_source": "CH1",
+  "trigger_type": "EDGE",
+  "trigger_slope": "RISE",
+  "trigger_level": 0.0,
+  "trigger_mode": "AUTO",
+  "battery_voltage": null,
+  "acquire_mode": "SAMple",
+  "measurement": null,
+  "channels": {
+    "1": {
+      "input_coupling": "DC",
+      "vertical_scale": 5.0,
+      "vertical_position": null,
+      "offset": 0.0,
+      "termination": 1000000.0,
+      "bandwidth": null
+    },
+    "2": {
+      "input_coupling": null,
+      "vertical_scale": null,
+      "vertical_position": null,
+      "offset": null,
+      "termination": null,
+      "bandwidth": null
+    }
+  }
+}
