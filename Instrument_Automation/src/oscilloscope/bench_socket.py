@@ -774,8 +774,12 @@ def acquire(scope: SocketScope, channel: int = 1, points: int = 1000) -> Wavefor
     if getattr(scope, "vendor", "tektronix") == "keysight":
         # --- Keysight: :WAVeform:PREamble? + :WAVeform:DATA? (ASCII = already in volts) ---
         src = f"CHANnel{channel}"
+        # A Keysight source must be DISPLAYED to have a preamble/data - an off channel returns
+        # an empty preamble (which reads back as "nothing captured"). Turn it on first.
+        scope.write(f":{src}:DISPlay ON")
         scope.write(f":WAVeform:SOURce {src}")
         scope.write(":WAVeform:FORMat ASCii")
+        scope.write(":WAVeform:POINts:MODE NORMal")   # defined record; NORMal is safe on all X-series
         scope.write(f":WAVeform:POINts {points}")
         pre = _query_nonempty(scope, ":WAVeform:PREamble?")
         if not pre:
@@ -1452,9 +1456,10 @@ def acquire_many(scope: SocketScope, channels: list[int],
 
     Channels with no data are skipped (with a note).
     """
+    ks = getattr(scope, "vendor", "tektronix") == "keysight"
     was_running = is_running(scope)
     if was_running:
-        scope.write("ACQuire:STATE STOP")     # freeze one record for a coherent read
+        scope.write(":STOP" if ks else "ACQuire:STATE STOP")   # freeze one record for a coherent read
     try:
         waves: dict[int, Waveform] = {}
         for ch in channels:
@@ -1466,7 +1471,7 @@ def acquire_many(scope: SocketScope, channels: list[int],
             waves[ch] = wf
     finally:
         if was_running:
-            scope.write("ACQuire:STATE RUN")   # leave the scope as we found it (live)
+            scope.write(":RUN" if ks else "ACQuire:STATE RUN")  # leave the scope as we found it (live)
     return waves
 
 
@@ -1589,7 +1594,16 @@ def save_png_joint(waves: dict[int, Waveform], path: str, label: str = "") -> bo
 #                  trigger and the record to fill, and only then read.
 # ---------------------------------------------------------------------------
 def is_running(scope: SocketScope) -> bool:
-    """True if the scope is currently acquiring (so its record can change under us)."""
+    """True if the scope is currently acquiring (so its record can change under us).
+
+    Vendor-aware: Tektronix answers ACQuire:STATE?; Keysight has no equivalent, so we read the
+    Run bit (bit 3, weight 8) of its Operation Status condition register.
+    """
+    if getattr(scope, "vendor", "tektronix") == "keysight":
+        try:  # TODO(confirm): :OPERegister:CONDition? Run bit against the live DSO-X 3034G
+            return (int(float(scope.query(":OPERegister:CONDition?") or 0)) & 8) != 0
+        except ValueError:
+            return False
     return scope.query("ACQuire:STATE?").strip().upper() in ("1", "ON", "RUN")
 
 
@@ -1649,6 +1663,17 @@ def arm_acquisition(scope: SocketScope) -> bool:
     read the frozen record later with a plain capture (single=False). Returns True
     once the arm command is sent.
     """
+    if getattr(scope, "vendor", "tektronix") == "keysight":
+        # Keysight: :SINGle arms exactly one acquisition - it waits for the trigger, captures
+        # one record, then STOPs (freezes) it. The equivalent of the Tektronix arm below.
+        mode = scope.query(":TRIGger:SWEep?").strip().upper()
+        if mode.startswith("AUTO"):
+            print("WARNING: sweep is AUTO - the scope will self-trigger after a timeout, so the\n"
+                  "         record may fill WITHOUT your event. Use a NORMal-sweep setup.",
+                  file=sys.stderr)
+        scope.write(":SINGle")                  # arm one acquisition; returns without waiting
+        return True
+
     # In AUTO mode the scope force-triggers after a timeout, so the record can fill
     # WITHOUT your event ever happening. Warn loudly - this is a trap.
     mode = scope.query("TRIGger:A:MODe?").strip().upper()

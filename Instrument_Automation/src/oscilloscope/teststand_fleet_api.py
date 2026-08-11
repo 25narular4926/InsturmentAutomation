@@ -412,6 +412,16 @@ def capture(alias: str, channels: str = "1", points: int = 0, single: bool = Fal
         _waves[alias] = bs.acquire_many(scope, chans, n_points)
     else:
         _waves[alias] = bs.capture_live(scope, chans, n_points)
+
+    # Fail HERE, with a clear reason, rather than letting an empty capture surface later as a
+    # confusing "nothing captured" error inside save_csv/save_png.
+    if not _waves.get(alias):
+        vendor = getattr(scope, "vendor", "tektronix")
+        raise RuntimeError(
+            f"[{alias}] capture returned no waveform on channel(s) {chans} ({vendor}). "
+            f"Check the channel is displayed and the acquisition completed "
+            f"(a trigger that never fired leaves an empty record)."
+        )
     return len(_waves[alias]) == len(chans)
 
 
