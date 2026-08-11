@@ -33,8 +33,17 @@ import sys
 from pathlib import Path
 
 # --- Reach ONLY the Instrument_Automation library (its combined teststand_api) -----------
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-_SRC = _REPO_ROOT / "Instrument_Automation" / "src"
+# Walk up from this file until we find Instrument_Automation/src, so the PoC keeps working
+# wherever this folder is moved to in the tree.
+def _find_instrument_src() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "Instrument_Automation" / "src"
+        if candidate.is_dir():
+            return candidate
+    raise RuntimeError(f"Could not locate Instrument_Automation/src above {__file__}")
+
+
+_SRC = _find_instrument_src()
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 _HERE = Path(__file__).resolve().parent
@@ -276,6 +285,16 @@ class TestStand:
     # ----- typed workflow steps (so bools/ints reach teststand_api correctly) -----
     def connect_matching_step(self, alias, serial, port=5025):
         return self.invoke("connect_matching", str(alias), str(serial), int(port))
+
+    def connect_matching_generator_step(self, alias, serial, port=5025):
+        """Same teststand_api function the bench uses (connect_matching auto-detects the
+        driver); offline we know from the sentence it is a generator, so seed the AFG session."""
+        self._calls.append(("connect_matching", [str(alias), str(serial), int(port)]))
+        fake = fake_instrument.FakeInstrument(vendor=self._vendor)
+        self._sessions[alias] = fake
+        _fleet._afgs[alias] = fake
+        self._last_result = fake.idn
+        return fake.idn
 
     def configure_scope_step(self, alias, setup, channels="", duration_s=0.0):
         return self.invoke("configure_scope", str(alias), str(setup), str(channels),

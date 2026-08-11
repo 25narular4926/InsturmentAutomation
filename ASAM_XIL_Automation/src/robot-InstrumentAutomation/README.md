@@ -119,11 +119,16 @@ Each line is a direct instruction (no `when`/`then`); statements that act also c
 
 It runs **offline against a fake instrument** (`fake_instrument.py`) that echoes settings and
 serves a synthetic waveform, so `capture` and `save` genuinely execute — a real CSV lands in
-`results/captures/`, and `results/scpi/workflow_<alias>.log` records (for traceability, without
-the author writing any of it) both the ordered teststand_api calls and the SCPI they put on the
-wire. The suite also runs the **dc-level** flow and the **ECM-triangle** flow (drive a generator,
-single-shot capture, save, output off) — the same flows the `Instrument_Automation` demo scripts
-use.
+`results/captures/`, and `results/scpi/workflow_<alias>_<suite>.log` records (for traceability,
+without the author writing any of it) both the ordered teststand_api calls and the SCPI they put
+on the wire. The suite also runs the **dc-level** flow and an **ECM-triangle** flow.
+
+`suites/ecm_triangle.robot` is a full, faithful conversion of `Instrument_Automation`'s
+`teststand_ecm_triangle.py` demo script into plain English: it issues the **same teststand_api
+calls in the same order** — scan, connect both instruments by serial, identify, configure the
+generator (`triangle_1mhz`) and the scope (`ecm_20min`), output on, single-shot capture, measure
+(samples / peak / lowest / duration), save CSV + PNG, all outputs off, disconnect. The recorded
+call log matches the script call-for-call.
 
 Point the same suite at a real bench (don't inject the fake) and the identical steps drive real
 hardware.
@@ -154,9 +159,9 @@ function name.
 ## Run it
 
 ```bash
-cd ASAM_XIL_Automation/robot-InstrumentAutomation
+cd ASAM_XIL_Automation/src/robot-InstrumentAutomation
 python run.py                 # run every suite in suites/
-python run.py workflows       # run one suite by name
+python run.py ecm_triangle    # run one suite by name
 ```
 
 Outputs land in `results/`:
@@ -180,7 +185,8 @@ robot-InstrumentAutomation/
   suites/
     configure_scpi.robot  # scope configure suite (dc_read, bench_full, both vendors)
     generator_scpi.robot  # function-generator configure suite (sine, pulse)
-    workflows.robot       # complete flows in plain English: arm/capture, dc-level, ECM-triangle
+    workflows.robot       # complete flows in plain English: arm/capture, dc-level, gen+scope
+    ecm_triangle.robot    # plain-English conversion of teststand_ecm_triangle.py (same calls)
     natural_language.robot # reach any teststand_api function by describing what you want
   run.py                  # convenience runner (output -> results/)
   results/                # generated: report/log + SCPI logs + saved captures (gitignored)

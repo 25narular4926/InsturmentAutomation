@@ -16,7 +16,9 @@ Confirm channel ${n} on "${alias}" was set to ${volts} volts per division
 
 Save the SCPI and the recorded calls for "${alias}" to a log
     [Documentation]    Traceability: write the ordered teststand_api calls AND the SCPI they
-    ...                sent to a file - the author writes none of it.
-    ${path}=    Set Variable    ${CURDIR}/../results/scpi/workflow_${alias}.log
+    ...                sent to a file - the author writes none of it. The suite name is in the
+    ...                filename so different flows never overwrite each other's log.
+    ${suite}=    Evaluate    "${SUITE NAME}".lower().replace(" ", "_")
+    ${path}=    Set Variable    ${CURDIR}/../results/scpi/workflow_${alias}_${suite}.log
     Write Workflow Scpi Log    ${alias}    ${path}
     File Should Exist    ${path}

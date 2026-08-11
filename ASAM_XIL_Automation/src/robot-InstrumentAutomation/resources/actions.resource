@@ -39,7 +39,7 @@ Connect to the scope "${alias}" at address "${host}"
     Result Should Be True
 
 Connect to the generator "${alias}" with serial "${serial}"
-    Invoke    connect_function_gen    ${alias}    ${serial}    ${5025}
+    Connect Matching Generator Step    ${alias}    ${serial}
     Result Should Be True
 
 Confirm at least one scope is connected

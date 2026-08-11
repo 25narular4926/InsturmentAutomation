@@ -34,9 +34,17 @@ import sys
 from pathlib import Path
 
 # --- Reach ONLY the Instrument_Automation library (its combined teststand_api) -----------
-# libraries/ -> robot-InstrumentAutomation/ -> ASAM_XIL_Automation/ -> repo root
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-_SRC = _REPO_ROOT / "Instrument_Automation" / "src"
+# Walk up from this file until we find Instrument_Automation/src, so the PoC keeps working
+# wherever this folder is moved to in the tree.
+def _find_instrument_src() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "Instrument_Automation" / "src"
+        if candidate.is_dir():
+            return candidate
+    raise RuntimeError(f"Could not locate Instrument_Automation/src above {__file__}")
+
+
+_SRC = _find_instrument_src()
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
