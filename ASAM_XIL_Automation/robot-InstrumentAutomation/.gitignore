@@ -1,0 +1,4 @@
+# Generated Robot output + captured SCPI transcripts (regenerate with run.py)
+results/
+__pycache__/
+*.pyc
