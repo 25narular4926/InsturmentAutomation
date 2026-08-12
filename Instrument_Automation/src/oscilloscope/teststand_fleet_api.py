@@ -59,6 +59,7 @@ _waves: dict[str, dict[int, bs.Waveform]] = {}
 _reports: dict[str, str] = {}
 _afg_reports: dict[str, str] = {}
 _record_length: dict[str, int] = {}
+_single_mode: dict[str, bool] = {}      # capture mode chosen at configure(): True=single-shot arm
 _armed: dict[str, list[int]] = {}       # channels armed by arm(), read back by read_armed()
 _last_found: list[dict] = []       # cache of the last scan, so connect_matching can reuse it
 
@@ -349,12 +350,19 @@ def list_setups() -> list[str]:
 
 
 def configure(alias: str, setup_name: str = "bench_full", channels: str = "",
-              duration_s: float = 0.0) -> bool:
+              duration_s: float = 0.0, single: bool = False) -> bool:
     """Apply a named setup to one scope and verify every setting read back.
 
     Same behaviour as the single-scope configure(), but for the scope named `alias`.
+
+    single : the capture mode this scope will use by default - remembered here so it is set
+        ONCE at configure time (and, being a call argument, never stale like an edited config).
+        False (default) = self-triggered capture (capture_live: always fills a record, works on
+        a steady/flat signal and on Keysight regardless of sweep mode). True = arm one shot and
+        wait for a real trigger. capture() uses this unless a capture call overrides it.
     """
     scope = _require_scope(alias)
+    _single_mode[alias] = bool(single)
     setup = bs.SETUPS.get(setup_name)
     if setup is None:
         raise ValueError(f"Unknown setup {setup_name!r}. Available: {', '.join(bs.SETUPS)}")
@@ -390,20 +398,23 @@ def get_config_report(alias: str) -> str:
     return _reports.get(alias, "")
 
 
-def capture(alias: str, channels: str = "1", points: int = 0, single: bool = False,
+def capture(alias: str, channels: str = "1", points: int = 0, single: bool | None = None,
             timeout_s: float = 120.0) -> bool:
     """Capture one scope's channels into memory for its get_*/save_* calls.
 
-    single=False (default) forces a fresh, frozen record via AUTO self-trigger and reads it -
-    vendor-aware, so it works on both Tektronix and Keysight even when the configured trigger
-    would never fire. single=True instead arms ONE real acquisition and waits for the trigger
-    (Tektronix). points=0 uses the record length that scope's configure set.
+    single=None (default) uses the mode chosen at configure() for this scope (default
+    self-triggered). single=False forces a fresh, frozen record via AUTO self-trigger and
+    reads it - vendor-aware, so it works on both Tektronix and Keysight even when the
+    configured trigger would never fire. single=True instead arms ONE real acquisition and
+    waits for the trigger. points=0 uses the record length that scope's configure set.
     """
     scope = _require_scope(alias)
     chans = _parse_channels(channels) or [1]
     n_points = int(points) if int(points) > 0 else (_record_length.get(alias, 0) or 1000)
 
-    if single:
+    # None -> the mode configure() stored for this scope (default False = self-triggered).
+    use_single = _single_mode.get(alias, False) if single is None else bool(single)
+    if use_single:
         if not bs.arm_single(scope, float(timeout_s)):
             raise TimeoutError(
                 f"[{alias}] no trigger within {timeout_s:g} s. Check the trigger, and that "

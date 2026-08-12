@@ -134,15 +134,20 @@ def list_scope_setups() -> list[str]:
 
 
 def configure_scope(alias: str, setup: str = "bench_full", channels: str = "1,2",
-                    duration_s: float = 0.0) -> bool:
+                    duration_s: float = 0.0, single: bool = False) -> bool:
     """Apply a named scope setup to one scope and verify every setting read back.
 
     setup      : a name from list_scope_setups(), e.g. "bench_full".
     channels   : "1" or "1,2" - which channels to configure.
     duration_s : >0 overrides the setup's timebase with a total capture time in seconds.
+    single     : the capture mode for this scope, chosen HERE so it is set once and can't go
+        stale like an edited config. False (default) = self-triggered capture that always fills
+        a record (works on a steady signal, and on Keysight regardless of the sweep mode - this
+        is the fix for a capture that times out waiting for a trigger). True = arm one shot and
+        wait for a real trigger. capture_scope() uses this unless you override it there.
     Returns True only if every setting read back correctly (see get_scope_config_report).
     """
-    return _fleet.configure(alias, setup, channels, float(duration_s))
+    return _fleet.configure(alias, setup, channels, float(duration_s), bool(single))
 
 
 def get_scope_config_report(alias: str) -> str:
@@ -150,17 +155,19 @@ def get_scope_config_report(alias: str) -> str:
     return _fleet.get_config_report(alias)
 
 
-def capture_scope(alias: str, channels: str = "1", points: int = 0, single: bool = False,
+def capture_scope(alias: str, channels: str = "1", points: int = 0, single: bool | None = None,
                   timeout_s: float = 120.0) -> bool:
     """Capture one scope's channels into memory for its scope_*/save_* calls.
 
     channels  : "1" or "1,2".
     points    : 0 = use the record length the scope's configure set.
-    single    : True arms a single acquisition and waits for a trigger (needs NORMal trigger);
-                False reads the record already on the scope.
+    single    : None (default) uses the mode you set on configure_scope() for this scope.
+                True arms a single acquisition and waits for a trigger (needs NORMal trigger);
+                False self-triggers and reads a fresh record. Pass it here only to override
+                what configure_scope() chose.
     Returns True if every requested channel returned data.
     """
-    return _fleet.capture(alias, channels, int(points), bool(single), float(timeout_s))
+    return _fleet.capture(alias, channels, int(points), single, float(timeout_s))
 
 
 def arm_scope(alias: str, channels: str = "1") -> bool:
